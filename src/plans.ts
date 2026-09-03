@@ -2217,6 +2217,22 @@ export function failJobsByHeartbeat (schema: string, table: string, queues: stri
   return locked(schema, failJobs(schema, table, where, output), table + 'failJobsByHeartbeat', noAdvisoryLocks)
 }
 
+// Replays the attempt bookkeeping a fetch applies, for a transactional worker whose transaction
+// rolled back. The rollback un-fetched the jobs, taking `started_on` and the `retry_count`
+// increment with it, so failJobsById would read every attempt as the first one and the job would
+// retry forever. Mirrors the SET clause in fetchNextJob, and runs on the pooled connection just
+// before the fail so the retry ladder advances exactly as it does for a normal worker.
+export function markJobsAttempted (schema: string, table: string) {
+  return `
+    UPDATE ${schema}.${table}
+    SET started_on = now(),
+      retry_count = CASE WHEN started_on IS NOT NULL THEN retry_count + 1 ELSE retry_count END
+    WHERE name = $1
+      AND id = ANY($2::uuid[])
+      AND state < '${JOB_STATES.completed}'
+  `
+}
+
 export function touchJobs (schema: string, table: string) {
   return `
     WITH results AS (
