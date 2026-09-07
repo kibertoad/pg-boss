@@ -91,6 +91,10 @@ describe('rrule', function () {
     // property names are case insensitive, and an export arrives with CRLF line endings
     expect(next('dtstart:20260901T090000Z\r\nrrule:freq=daily')).toBe('2026-09-07T09:00:00.000Z')
 
+    // a blank line between properties, and the one a trailing line break leaves at the end, are
+    // neither of them a property to reject
+    expect(next('DTSTART:20260901T090000Z\n\nRRULE:FREQ=DAILY\n')).toBe('2026-09-07T09:00:00.000Z')
+
     // a long line arrives folded, which is a line break and a space rather than a new property
     expect(next('DTSTART:20260901T090000Z\r\nRRULE:FREQ=DAILY\r\nEXDATE:20260907T090000Z,\r\n 20260908T090000Z'))
       .toBe('2026-09-09T09:00:00.000Z')
@@ -199,6 +203,13 @@ describe('rrule', function () {
     expect(() => assertRrule('FREQ=DAILY;BYHOUR=9,9', 'UTC')).not.toThrow()
   })
 
+  it('reads past an empty part, which a trailing separator leaves behind', function () {
+    // A trailing or doubled `;` leaves a part with nothing in it, which is not a part with a
+    // mistake in it: there is no name there to have got wrong and no value there to be dropped.
+    expect(() => assertRrule('FREQ=DAILY;BYHOUR=9;', 'UTC')).not.toThrow()
+    expect(next('FREQ=DAILY;;BYHOUR=9')).toBe('2026-09-07T09:00:00.000Z')
+  })
+
   it('rejects a part with no value, which the parser dies inside on', function () {
     expect(() => assertRrule('FREQ=DAILY;BYHOUR', 'UTC')).toThrow('rrule part "BYHOUR" has no value')
     expect(() => assertRrule('FREQ=DAILY;BYHOUR=9;UNTIL', 'UTC')).toThrow('rrule part "UNTIL" has no value')
@@ -212,6 +223,15 @@ describe('rrule', function () {
       .toThrow('rrule expression has more than one BYHOUR part')
 
     expect(() => assertRrule('FREQ=DAILY;byhour=9;BYHOUR=17', 'UTC')).toThrow(/more than one BYHOUR/)
+  })
+
+  it('rejects an expression with no RRULE to recur on', function () {
+    // rrule-temporal recurs on an RRULE and nothing else, so RDATE lines on their own are a set of
+    // dates rather than a recurrence, whatever RFC 5545 allows a calendar entry to carry.
+    expect(() => assertRrule('DTSTART:20991001T090000Z\nRDATE:20991008T050000Z', 'UTC'))
+      .toThrow('rrule expression has no RRULE to recur on')
+
+    expect(() => assertRrule('EXDATE:20991008T050000Z', 'UTC')).toThrow(/no RRULE to recur on/)
   })
 
   it('rejects a property no parser reads, which would otherwise change the anchor', function () {

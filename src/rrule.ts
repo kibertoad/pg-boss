@@ -154,12 +154,17 @@ function toIcs (expression: string): { ics: string, rule: string } {
     lines.push(property ? text : `RRULE:${text}`)
   }
 
+  // rrule-temporal recurs on an RRULE and nothing else, so an entry carrying only RDATE lines has
+  // no recurrence for it to read. Named here rather than left to the parser, which answers a
+  // missing rule with the FREQ part missing from it.
+  assert(rule !== null, 'rrule expression has no RRULE to recur on')
+
   if (dtstart === null) {
     // COUNT counts from DTSTART, so on the epoch anchor every count worth having is long spent: the
     // rule parses, has no occurrence left, and the schedule it lands on never sends anything. Named
     // here rather than left to the check in assertRrule, which reports the same rule as spent
     // without saying what would fix it.
-    assert(!/(^|;)COUNT=/i.test(rule || ''),
+    assert(!/(^|;)COUNT=/i.test(rule),
       'rrule expression uses COUNT, which counts occurrences from DTSTART, so it needs a DTSTART of its own')
 
     lines.unshift(`DTSTART:${EPOCH_DTSTART}`)
@@ -167,7 +172,7 @@ function toIcs (expression: string): { ics: string, rule: string } {
 
   assertDates(dates, dtstart ?? EPOCH_DTSTART)
 
-  return { ics: lines.join('\n'), rule: rule ?? '' }
+  return { ics: lines.join('\n'), rule }
 }
 
 /** Rejects a recur rule part no parser reads, which would otherwise change the schedule silently. */

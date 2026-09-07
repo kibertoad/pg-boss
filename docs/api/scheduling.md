@@ -74,6 +74,7 @@ A rule is understood by any instance running a release that supports one. During
 * an unknown part such as `BYHOURS=9`, or an unknown property such as `DTSRAT`, which a parser drops before evaluating the rest
 * a value out of range, such as `BYHOUR=25` or the `25` in `BYHOUR=9,25`, which a parser drops just as quietly
 * a part named twice, such as `BYHOUR=9;BYHOUR=17`, where the second replaces the first rather than widening it
+* an expression with no `RRULE` to recur on, such as `DTSTART` and `RDATE` lines on their own
 * a second `DTSTART` or `RRULE`
 * an `RDATE` or `EXDATE` given as a date where `DTSTART` is a date time, which excludes or adds midnight rather than the occurrence it names
 * the combinations RFC 5545 forbids outright, such as `BYMONTHDAY` with a weekly frequency
