@@ -25,9 +25,12 @@ function makeTk () {
   return new Timekeeper(db as any, {} as any, { schema: 'test' } as any)
 }
 
-/** The 60-second throttle slot a forwarded job lands in, which is what collapses a repeat send. */
+/**
+ * The 60-second throttle slot a forwarded job lands in, which is what collapses a repeat send,
+ * written the way the insert files it: UTC wall time, without a zone.
+ */
 function slotOf (epochMs: number) {
-  return Math.floor(epochMs / 60_000)
+  return new Date(Math.floor(epochMs / 60_000) * 60_000).toISOString().replace('T', ' ').slice(0, 19)
 }
 
 describe('rrule', function () {
@@ -37,7 +40,13 @@ describe('rrule', function () {
     expect(isRrule('DTSTART:20260901T090000Z\nRRULE:FREQ=DAILY')).toBe(true)
     expect(isRrule('WKST=SU;FREQ=WEEKLY;BYDAY=TU')).toBe(true)
 
-    // no cron field can contain an `=`, so nothing that already worked is read as a rule
+    // a line below the first one names it just as well, so a block that opens with something else
+    // is still read as a rule and reported as one
+    expect(isRrule('BEGIN:VEVENT\nDTSTART:20260901T090000Z\nRRULE:FREQ=DAILY\nEND:VEVENT')).toBe(true)
+    expect(isRrule('SUMMARY:standup\nRRULE:FREQ=DAILY')).toBe(true)
+
+    // no cron field can contain an `=`, a `:` or a `;`, so nothing that already worked is read as a
+    // rule
     expect(isRrule('* * * * *')).toBe(false)
     expect(isRrule('0 3 * * *')).toBe(false)
     expect(isRrule('30 30 3 * * *')).toBe(false)
@@ -72,7 +81,7 @@ describe('rrule', function () {
       .toBe('2026-09-07T14:00:00.000Z')
   })
 
-  it('accepts the iCalendar shape a calendar exports', function () {
+  it('accepts the recurrence lines of a calendar entry', function () {
     expect(next('DTSTART:20260907T090000Z\nRRULE:FREQ=DAILY\nEXDATE:20260907T090000Z'))
       .toBe('2026-09-08T09:00:00.000Z')
 
@@ -109,11 +118,59 @@ describe('rrule', function () {
       .toBe('2026-03-29T07:00:00.000Z')
   })
 
+  it('counts an hourly interval in elapsed hours and a BYHOUR list in wall clock hours', function () {
+    // The epoch anchor sits in standard time and an HOURLY INTERVAL counts elapsed hours, so its
+    // occurrences keep their phase in UTC and their local time moves with the offset: noon in
+    // Chicago in January, one in the afternoon in July.
+    expect(next('FREQ=HOURLY;INTERVAL=6', 'America/Chicago', new Date('2026-01-15T12:00:00Z')))
+      .toBe('2026-01-15T18:00:00.000Z')
+    expect(next('FREQ=HOURLY;INTERVAL=6', 'America/Chicago', new Date('2026-07-15T12:00:00Z')))
+      .toBe('2026-07-15T18:00:00.000Z')
+
+    // Naming the hours pins them to the clock instead, which is what the cron expression an
+    // interval looks like does.
+    expect(next('FREQ=DAILY;BYHOUR=0,6,12,18', 'America/Chicago', new Date('2026-01-15T12:00:00Z')))
+      .toBe('2026-01-15T18:00:00.000Z')
+    expect(next('FREQ=DAILY;BYHOUR=0,6,12,18', 'America/Chicago', new Date('2026-07-15T12:00:00Z')))
+      .toBe('2026-07-15T17:00:00.000Z')
+  })
+
+  it('answers from a rule it has already built, and keeps answering once the cache is full', function () {
+    const expression = 'FREQ=WEEKLY;BYDAY=MO,WE,FR;BYHOUR=9;BYMINUTE=30'
+
+    // One instance serves every `after` it is asked about, forwards or back, and the same
+    // expression on two schedules in two zones is two rules
+    expect(next(expression, 'Europe/Berlin')).toBe('2026-09-07T07:30:00.000Z')
+    expect(next(expression, 'UTC')).toBe('2026-09-07T09:30:00.000Z')
+    expect(next(expression, 'Europe/Berlin', new Date('2026-09-07T08:00:00Z'))).toBe('2026-09-09T07:30:00.000Z')
+    expect(next(expression, 'Europe/Berlin')).toBe('2026-09-07T07:30:00.000Z')
+
+    // Past the cap the cache is dropped wholesale, which costs a rebuild and changes no answer
+    for (let interval = 1; interval <= 1100; interval++) {
+      nextOccurrence(`FREQ=MINUTELY;INTERVAL=${interval}`, AFTER, 'UTC')
+    }
+
+    expect(next(expression, 'Europe/Berlin')).toBe('2026-09-07T07:30:00.000Z')
+  })
+
   it('rejects COUNT without a DTSTART to count from', function () {
     // On the epoch anchor every count worth having is long spent, so the schedule would parse and
     // then never send anything.
     expect(() => assertRrule('FREQ=DAILY;COUNT=3', 'UTC')).toThrow(/COUNT/)
-    expect(() => assertRrule('DTSTART:20261001T090000Z\nRRULE:FREQ=DAILY;COUNT=3', 'UTC')).not.toThrow()
+    expect(() => assertRrule('DTSTART:20991001T090000Z\nRRULE:FREQ=DAILY;COUNT=3', 'UTC')).not.toThrow()
+  })
+
+  it('rejects a rule with nothing left to send', function () {
+    // The row would sit in the table with every pass evaluating it and no job ever sent, which is
+    // the one failure a caller cannot see.
+    expect(() => assertRrule('FREQ=DAILY;UNTIL=20200101T000000Z', 'UTC'))
+      .toThrow('rrule expression has no occurrence left, so the schedule would never send a job')
+
+    expect(() => assertRrule('DTSTART:20200101T000000Z\nRRULE:FREQ=DAILY;COUNT=3', 'UTC'))
+      .toThrow(/no occurrence left/)
+
+    expect(() => assertRrule('DTSTART:20200101T000000Z\nRRULE:FREQ=DAILY;UNTIL=20990101T000000Z', 'UTC'))
+      .not.toThrow()
   })
 
   it('rejects a part no parser reads rather than evaluating the rest', function () {
@@ -124,6 +181,39 @@ describe('rrule', function () {
     expect(() => assertRrule('FREQ=DAILY;X-FOO=1;BYHOUR=9', 'UTC')).not.toThrow()
   })
 
+  it('rejects a part value the parser would drop, which would run the job at the anchor', function () {
+    // An out of range value leaves the rule with no such part at all, so `BYHOUR=25` is a schedule
+    // that runs at the anchor's midnight rather than one that reports a problem.
+    expect(() => assertRrule('FREQ=DAILY;BYHOUR=25', 'UTC'))
+      .toThrow('Unsupported value in rrule part "BYHOUR=25"')
+
+    expect(() => assertRrule('FREQ=DAILY;BYMINUTE=90', 'UTC')).toThrow(/Unsupported value/)
+    expect(() => assertRrule('FREQ=DAILY;BYSECOND=99', 'UTC')).toThrow(/Unsupported value/)
+    expect(() => assertRrule('FREQ=MONTHLY;BYMONTHDAY=32', 'UTC')).toThrow(/Unsupported value/)
+
+    // and one value of a list dropped is a send of the day lost
+    expect(() => assertRrule('FREQ=DAILY;BYHOUR=9,25', 'UTC'))
+      .toThrow('Unsupported value in rrule part "BYHOUR=9,25"')
+
+    // a repeat of a value the parser collapses is not a value it read past
+    expect(() => assertRrule('FREQ=DAILY;BYHOUR=9,9', 'UTC')).not.toThrow()
+  })
+
+  it('rejects a part with no value, which the parser dies inside on', function () {
+    expect(() => assertRrule('FREQ=DAILY;BYHOUR', 'UTC')).toThrow('rrule part "BYHOUR" has no value')
+    expect(() => assertRrule('FREQ=DAILY;BYHOUR=9;UNTIL', 'UTC')).toThrow('rrule part "UNTIL" has no value')
+    expect(() => assertRrule('FREQ=DAILY;BYHOUR=', 'UTC')).toThrow('rrule part "BYHOUR=" has no value')
+  })
+
+  it('rejects a repeated part instead of evaluating the last one', function () {
+    // A second BYHOUR replaces the first rather than widening it, so this is a schedule that skips
+    // the morning without a word.
+    expect(() => assertRrule('FREQ=DAILY;BYHOUR=9;BYHOUR=17', 'UTC'))
+      .toThrow('rrule expression has more than one BYHOUR part')
+
+    expect(() => assertRrule('FREQ=DAILY;byhour=9;BYHOUR=17', 'UTC')).toThrow(/more than one BYHOUR/)
+  })
+
   it('rejects a property no parser reads, which would otherwise change the anchor', function () {
     // A mistyped DTSTART would be dropped and leave the rule anchored on the epoch
     expect(() => assertRrule('DTSRAT:20260901T090000Z\nRRULE:FREQ=DAILY', 'UTC'))
@@ -132,12 +222,45 @@ describe('rrule', function () {
     expect(() => assertRrule('SUMMARY:standup\nRRULE:FREQ=DAILY', 'UTC')).toThrow(/Unsupported property/)
   })
 
+  it('rejects a calendar entry with the lines wrapped around its recurrence', function () {
+    // Skipping whatever sits between BEGIN and END is what would let a mistyped DTSTART through, so
+    // the wrapper is reported rather than read past.
+    expect(() => assertRrule('BEGIN:VEVENT\nDTSTART:20260901T090000Z\nRRULE:FREQ=DAILY\nEND:VEVENT', 'UTC'))
+      .toThrow('rrule expression should be the DTSTART, RRULE, RDATE and EXDATE lines of a calendar entry, without the BEGIN and END lines around them')
+
+    expect(() => assertRrule('BEGIN:VCALENDAR\nRRULE:FREQ=DAILY\nEND:VCALENDAR', 'UTC'))
+      .toThrow(/without the BEGIN and END lines/)
+  })
+
   it('rejects a second DTSTART or RRULE instead of quietly dropping one', function () {
     expect(() => assertRrule('RRULE:FREQ=DAILY\nRRULE:FREQ=WEEKLY', 'UTC'))
       .toThrow('rrule expression has more than one RRULE')
 
     expect(() => assertRrule('DTSTART:20260101T090000Z\nDTSTART:20260102T090000Z\nRRULE:FREQ=DAILY', 'UTC'))
       .toThrow('rrule expression has more than one DTSTART')
+  })
+
+  it('rejects an RDATE or EXDATE that does not carry the time of day DTSTART does', function () {
+    // A date on its own is read as midnight, so the 09:00 occurrence this was meant to exclude
+    // would be sent anyway, which is the holiday nobody excluded.
+    expect(() => assertRrule('DTSTART:20260901T090000Z\nRRULE:FREQ=DAILY\nEXDATE;VALUE=DATE:20991224', 'UTC'))
+      .toThrow('rrule EXDATE "20991224" must have the same value type as DTSTART: a date time such as 20991224T090000')
+
+    expect(() => assertRrule('DTSTART:20260901T090000Z\nRRULE:FREQ=DAILY\nEXDATE:20991224', 'UTC'))
+      .toThrow(/same value type as DTSTART/)
+
+    expect(() => assertRrule('DTSTART:20260901T090000Z\nRRULE:FREQ=DAILY\nRDATE:20991224', 'UTC'))
+      .toThrow('rrule RDATE "20991224" must have the same value type as DTSTART: a date time such as 20991224T090000')
+
+    // a date time is what a date time DTSTART asks for, and a date is what a date one asks for
+    expect(() => assertRrule('DTSTART:20260901T090000Z\nRRULE:FREQ=DAILY\nEXDATE:20991224T090000Z', 'UTC'))
+      .not.toThrow()
+
+    expect(() => assertRrule('DTSTART;VALUE=DATE:20260901\nRRULE:FREQ=DAILY\nEXDATE;VALUE=DATE:20991224', 'UTC'))
+      .not.toThrow()
+
+    expect(() => assertRrule('DTSTART;VALUE=DATE:20260901\nRRULE:FREQ=DAILY\nEXDATE:20991224T090000Z', 'UTC'))
+      .toThrow('rrule EXDATE "20991224T090000Z" must have the same value type as DTSTART: a date such as 20991224')
   })
 
   it('rejects a rule RFC 5545 forbids, whose reading no two engines agree on', function () {
@@ -151,6 +274,11 @@ describe('rrule', function () {
   it('rejects an unusable time zone in the same words a cron schedule does', function () {
     expect(() => assertRrule('FREQ=DAILY;BYHOUR=9', 'America/New_Yrok'))
       .toThrow('Unknown or unsupported time zone: "America/New_Yrok"')
+
+    // including for a rule whose DTSTART names a zone of its own, which leaves rrule-temporal
+    // ignoring the one the schedule would be stored with
+    expect(() => assertRrule('DTSTART;TZID=Europe/Berlin:20260901T090000\nRRULE:FREQ=DAILY', 'Nowhere/Special'))
+      .toThrow('Unknown or unsupported time zone: "Nowhere/Special"')
 
     // the expression is judged first, so a caller with two mistakes hears about the rule
     expect(() => assertRrule('FREQ=NOPE', 'America/New_Yrok')).toThrow(/Invalid FREQ value/)
@@ -205,20 +333,32 @@ describe('rrule', function () {
 
     const [first, second] = inserted.filter(job => job.singletonKey === 'rule__')
 
-    expect(first.singletonSeconds).toBe(60)
-    expect(second.singletonSeconds).toBe(60)
-
-    // Both passes file the occurrence in the slot it falls in, so the second job collapses into the
-    // first instead of being sent as a job of its own.
-    expect(slotOf(occurrence + 5_000 + first.singletonOffset * 1000)).toBe(slotOf(occurrence))
-    expect(slotOf(occurrence + 45_000 + second.singletonOffset * 1000)).toBe(slotOf(occurrence))
+    // Both passes name the slot the occurrence falls in, so the second job collapses into the first
+    // instead of being sent as a job of its own. A slot rather than an offset from the insert's own
+    // clock, so nothing the round trip costs can move it.
+    expect(first.singletonSlot).toBe(slotOf(occurrence))
+    expect(second.singletonSlot).toBe(slotOf(occurrence))
+    expect(first.singletonSeconds).toBeUndefined()
 
     // A cron occurrence keeps the slot every release has always filed it in: during a rolling
     // upgrade an instance on an older release computes that slot and no other.
     for (const job of inserted.filter(job => job.singletonKey === 'cron__')) {
       expect(job.singletonSeconds).toBe(60)
-      expect(job.singletonOffset).toBeUndefined()
+      expect(job.singletonSlot).toBeUndefined()
     }
+  })
+
+  it('collapses two jobs filed in one throttle slot and keeps two filed in different slots', async function () {
+    ctx.boss = await helper.start(ctx.bossConfig)
+
+    const insert = (singletonSlot: string) =>
+      ctx.boss!.insert(ctx.schema, [{ singletonKey: 'rule__', singletonSlot }] as any, { returnId: true })
+
+    // The slot a rule occurrence names, filed twice as two passes on either side of a boundary
+    // would file it, then a slot of its own for the occurrence a minute later.
+    expect(await insert('2026-09-07 12:00:00')).toHaveLength(1)
+    expect(await insert('2026-09-07 12:00:00')).toBeNull()
+    expect(await insert('2026-09-07 12:01:00')).toHaveLength(1)
   })
 
   it('sends a job for a schedule created from a recurrence rule', async function () {
@@ -252,8 +392,18 @@ describe('rrule', function () {
 
     await expect(ctx.boss.schedule(ctx.schema, 'FREQ=DAILY;BYHOURS=9')).rejects.toThrow(/Unsupported part/)
 
+    await expect(ctx.boss.schedule(ctx.schema, 'FREQ=DAILY;BYHOUR=25')).rejects.toThrow(/Unsupported value/)
+
     await expect(ctx.boss.schedule(ctx.schema, 'FREQ=DAILY', null, { tz: 'Nowhere/Special' }))
       .rejects.toThrow(/Unknown or unsupported time zone/)
+
+    // A block whose first line names something else is read as a rule all the same, so what reaches
+    // the caller is the property nobody supports rather than the characters cron-parser cannot read
+    await expect(ctx.boss.schedule(ctx.schema, 'SUMMARY:standup\nRRULE:FREQ=DAILY'))
+      .rejects.toThrow('Unsupported property "SUMMARY" in rrule expression. Supported properties: DTSTART, RRULE, RDATE, EXDATE')
+
+    await expect(ctx.boss.schedule(ctx.schema, 'BEGIN:VEVENT\nDTSTART:20260901T090000Z\nRRULE:FREQ=DAILY\nEND:VEVENT'))
+      .rejects.toThrow(/without the BEGIN and END lines/)
 
     expect(await ctx.boss.getSchedules()).toHaveLength(0)
   })

@@ -5,6 +5,7 @@ import * as Attorney from './attorney.ts'
 import type Manager from './manager.ts'
 import * as plans from './plans.ts'
 import { isRrule, nextOccurrence, assertRrule } from './rrule.ts'
+import { assertTimezone } from './timezone.ts'
 import { delay } from './tools.ts'
 import * as types from './types.ts'
 import { emitAndPersistWarning, type WarningContext } from './warning.ts'
@@ -36,29 +37,27 @@ const WARNING_TYPES = {
 // window apart into one job.
 const OCCURRENCE_WINDOW_SECONDS = 60
 
-// singleton_offset is an internal column of the insert path rather than a documented send option,
-// so the forwarded job widens JobInsert here rather than the type widening for everyone.
-type ForwardedJob = types.JobInsert & { singletonOffset?: number }
+// singletonSlot is an internal field of the insert path rather than a documented send option, so
+// the forwarded job widens JobInsert here rather than the type widening for everyone.
+type ForwardedJob = types.JobInsert & { singletonSlot?: string }
+
+// What evaluating one schedule answers with: the occurrence it has come due for, if any, and
+// whether the expression it came from is a recurrence rule, which is what decides the throttle slot
+// the forwarded job is filed in. Both in one value because both come of reading the expression
+// once, and a second reading is a second chance for the two to disagree.
+type DueOccurrence = { occurrence: Date | null, rule: boolean }
 
 /**
- * Asserts that `tz` is a time zone cron evaluation can actually use.
+ * The throttle slot an instant falls in, as the timestamp the insert files a job under.
  *
- * cron-parser validates `tz` lazily: parsing without a reference date never constructs a CronDate,
- * so every string is accepted and a bad zone only surfaces later, when a date is computed, as an
- * opaque "CronDate: unhandled timestamp". Passing a reference date here forces that construction so
- * a typo like 'America/New_Yrok' is rejected by schedule() rather than persisted to the schedule
- * table. Deliberately reuses cron-parser rather than an independent Intl check, so what schedule()
- * accepts is exactly what the cron pass can evaluate.
- *
- * The caller validates the cron expression first, so a failure here is attributable to the zone.
+ * `singleton_on` is a timestamp without a zone holding UTC wall time, which is what the insert's own
+ * slot expression computes from `now()` for a cron occurrence, so a slot measured here is rendered
+ * in the same terms.
  */
-function assertTimezone (tz: string): void {
-  try {
-    CronExpressionParser.parse('* * * * *', { tz, strict: false, currentDate: new Date() })
-  } catch {
-    // Quoted so an empty string renders as `""` rather than a dangling colon
-    throw new Error(`Unknown or unsupported time zone: "${tz}"`)
-  }
+function throttleSlot (instant: Date): string {
+  const width = OCCURRENCE_WINDOW_SECONDS * 1000
+
+  return new Date(Math.floor(instant.getTime() / width) * width).toISOString().replace('T', ' ').slice(0, 19)
 }
 
 class Timekeeper extends EventEmitter implements types.EventsMixin {
@@ -230,10 +229,10 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
     const databaseTime = this.databaseNow()
 
     for (const { name, key, data, options, cron, timezone } of schedules) {
-      let occurrence: Date | null
+      let due: DueOccurrence
 
       try {
-        occurrence = this.dueOccurrence(cron, timezone, databaseTime)
+        due = this.dueOccurrence(cron, timezone, databaseTime)
       } catch (err) {
         // Evaluating one row must not decide the fate of the others. schedule() now rejects an
         // unusable time zone, but a row written by an earlier release — or straight into the table —
@@ -257,21 +256,24 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
         continue
       }
 
-      if (occurrence) {
+      if (due.occurrence) {
         scheduled.push({
           data: { name, data, options },
           singletonKey: `${name}__${key}`,
-          singletonSeconds: OCCURRENCE_WINDOW_SECONDS,
           // A recurrence rule can put an occurrence anywhere in the minute, and a slot measured
           // from insert time would then straddle it: two passes on either side of a slot boundary
           // both find the occurrence inside the window and file it in a slot of their own, sending
-          // it twice. The offset pins the slot to the occurrence instead, rounded up so the shifted
-          // instant lands on or just after it rather than in the slot before.
+          // it twice. So a rule occurrence names the slot it falls in outright. An offset from the
+          // insert's own now() would not pin it: everything between reading the clock here and the
+          // insert committing counts towards the shifted instant, which lands in the next slot
+          // whenever that adds up to a boundary crossing.
           //
-          // Only for a rule. A cron occurrence is left in the slot every release has always filed
-          // it in, since an instance still running an older one during a rolling upgrade computes
-          // that slot and nothing else, and a slot the two disagree on collapses nothing.
-          ...(isRrule(cron) ? { singletonOffset: Math.ceil((occurrence.getTime() - databaseTime) / 1000) } : {})
+          // A cron occurrence keeps the slot every release has always filed it in, since an
+          // instance still running an older one during a rolling upgrade computes that slot and
+          // nothing else, and a slot the two disagree on collapses nothing.
+          ...(due.rule
+            ? { singletonSlot: throttleSlot(due.occurrence) }
+            : { singletonSeconds: OCCURRENCE_WINDOW_SECONDS })
         })
       }
     }
@@ -284,7 +286,7 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
   }
 
   shouldSendIt (cron: string, tz: string) {
-    return this.dueOccurrence(cron, tz) !== null
+    return this.dueOccurrence(cron, tz).occurrence !== null
   }
 
   /** The database's clock, as this instance last measured it. */
@@ -293,22 +295,25 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
   }
 
   /**
-   * The occurrence a schedule has come due for, or null if it has not.
+   * The occurrence a schedule has come due for, or null if it has not, and which of the two
+   * expression formats produced it.
    *
    * Due means "an occurrence in the last minute", whatever the pass interval: a pass runs every
    * `cronMonitorIntervalSeconds` (30 by default), so the window has to be wide enough that an
    * occurrence is still due when the next pass reaches it, and the throttle slot of the forwarded
    * job is what keeps the passes that follow from sending it a second time.
    */
-  private dueOccurrence (expression: string, tz: string, databaseTime = this.databaseNow()): Date | null {
-    if (isRrule(expression)) {
+  private dueOccurrence (expression: string, tz: string, databaseTime = this.databaseNow()): DueOccurrence {
+    const rule = isRrule(expression)
+
+    if (rule) {
       // Asked forwards from the start of the window rather than backwards from now: a rule with an
       // exhausted COUNT or a passed UNTIL has no occurrence behind it to find, and every engine
       // optimizes the forward direction.
       const window = new Date(databaseTime - OCCURRENCE_WINDOW_SECONDS * 1000)
       const occurrence = nextOccurrence(expression, window, tz)
 
-      return (occurrence !== null && occurrence.getTime() <= databaseTime) ? occurrence : null
+      return { occurrence: (occurrence !== null && occurrence.getTime() <= databaseTime) ? occurrence : null, rule }
     }
 
     const interval = CronExpressionParser.parse(expression, { tz, strict: false, currentDate: new Date(databaseTime) })
@@ -317,7 +322,7 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
 
     const previousDiff = (databaseTime - previous.getTime()) / 1000
 
-    return previousDiff < OCCURRENCE_WINDOW_SECONDS ? previous : null
+    return { occurrence: previousDiff < OCCURRENCE_WINDOW_SECONDS ? previous : null, rule }
   }
 
   private async onSendIt (jobs: types.Job<types.Request>[]): Promise<void> {

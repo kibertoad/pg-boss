@@ -30,7 +30,7 @@ For more cron documentation and examples see the docs for the [cron-parser packa
 
 ## RRULE expressions
 
-An expression carrying a `FREQ=` part, or starting with `DTSTART`, `RRULE`, `RDATE` or `EXDATE`, is read as a recurrence rule as defined in [RFC 5545](https://datatracker.ietf.org/doc/html/rfc5545#section-3.3.10) and evaluated by [rrule-temporal](https://www.npmjs.com/package/rrule-temporal). Everything else is a cron expression, which cannot be mistaken for a rule since no cron field contains `=`.
+An expression carrying a `FREQ=` part, or a line that opens with an iCalendar property such as `DTSTART` or `RRULE`, is read as a recurrence rule as defined in [RFC 5545](https://datatracker.ietf.org/doc/html/rfc5545#section-3.3.10) and evaluated by [rrule-temporal](https://www.npmjs.com/package/rrule-temporal). Everything else is a cron expression, which cannot be mistaken for a rule since no cron field contains `=`, `:` or `;`.
 
 Rules cover the schedules cron cannot express: the last Friday of the month, every second Monday, a schedule that stops on a date or after a number of runs.
 
@@ -39,7 +39,7 @@ Rules cover the schedules cron cannot express: the last Friday of the month, eve
 await boss.schedule('report', 'FREQ=MONTHLY;BYDAY=-1FR;BYHOUR=17', null, { tz: 'America/Chicago' })
 ```
 
-The expression is either the rule on its own, as above, or the iCalendar block a calendar exports, with a `DTSTART` line and optional `RDATE` and `EXDATE` lines:
+The expression is either the rule on its own, as above, or the recurrence lines of a calendar entry: a `DTSTART` line, the `RRULE` line, and optional `RDATE` and `EXDATE` lines. Paste those lines rather than a whole export, since a `UID`, a `SUMMARY` or the `BEGIN` and `END` lines around them say nothing about when a job should run and are rejected:
 
 ```js
 await boss.schedule('standup', [
@@ -55,11 +55,13 @@ await boss.schedule('standup', [
 
 * **DTSTART**
 
-  A rule that carries no `DTSTART` is anchored on 1970-01-01T00:00:00 in the schedule's time zone. That anchor is what an `INTERVAL` counts from, so `FREQ=HOURLY;INTERVAL=6` runs at 00:00, 06:00, 12:00 and 18:00 the way the equivalent cron expression would, and it is the same anchor in every instance and every release. Supply a `DTSTART` to choose the phase yourself. `COUNT` is rejected without one, since counting from the epoch leaves a rule with nothing left to send.
+  A rule that carries no `DTSTART` is anchored on 1970-01-01T00:00:00 in the schedule's time zone, the same anchor in every instance and every release. That anchor is what an `INTERVAL` counts from, so `FREQ=HOURLY;INTERVAL=6` runs every six hours from midnight on the epoch. Supply a `DTSTART` to choose the phase yourself. `COUNT` is rejected without one, since counting from the epoch leaves a rule with nothing left to send.
+
+  An `HOURLY`, `MINUTELY` or `SECONDLY` `INTERVAL` counts elapsed time rather than clock time, and the epoch anchor falls in standard time, so in a zone that observes daylight saving the local time of those occurrences moves with the offset: `FREQ=HOURLY;INTERVAL=6` with `tz: 'America/Chicago'` lands on 00:00, 06:00, 12:00 and 18:00 in January and on 01:00, 07:00, 13:00 and 19:00 in July. Name the hours to pin them to the clock instead. `FREQ=DAILY;BYHOUR=0,6,12,18` holds across a transition, as `0 */6 * * *` does.
 
 * **Finite rules**
 
-  `UNTIL` and `COUNT` are honored. Once the last occurrence has passed, the schedule stays in the table and sends nothing further.
+  `UNTIL` and `COUNT` are honored. Once the last occurrence has passed, the schedule stays in the table and sends nothing further. A rule that has nothing left to send when `schedule()` is called is rejected instead of stored, since a schedule that quietly does nothing is a failure nobody sees.
 
 * **Resolution**
 
@@ -67,7 +69,17 @@ await boss.schedule('standup', [
 
 A rule is understood by any instance running a release that supports one. During a rolling upgrade an instance still on an older release reads the expression as cron, cannot parse it, and reports an [`invalid_schedule`](./events.md#warning) warning until it is replaced, so rule schedules are best added once the deployment is upgraded.
 
-`schedule()` validates the expression, so a rule that would be read differently than it was meant is rejected before it reaches the table: an unknown part such as `BYHOURS=9`, an unknown property, a second `DTSTART` or `RRULE`, and the combinations RFC 5545 forbids outright, such as `BYMONTHDAY` with a weekly frequency.
+`schedule()` validates the expression, so a rule that would be read differently than it was meant is rejected before it reaches the table:
+
+* an unknown part such as `BYHOURS=9`, or an unknown property such as `DTSRAT`, which a parser drops before evaluating the rest
+* a value out of range, such as `BYHOUR=25` or the `25` in `BYHOUR=9,25`, which a parser drops just as quietly
+* a part named twice, such as `BYHOUR=9;BYHOUR=17`, where the second replaces the first rather than widening it
+* a second `DTSTART` or `RRULE`
+* an `RDATE` or `EXDATE` given as a date where `DTSTART` is a date time, which excludes or adds midnight rather than the occurrence it names
+* the combinations RFC 5545 forbids outright, such as `BYMONTHDAY` with a weekly frequency
+* a time zone no evaluation can use, reported in the same words a cron schedule reports it in
+
+## Managing schedules
 
 ### `schedule(name, cron, data, options)`
 

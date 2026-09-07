@@ -1954,6 +1954,11 @@ export function insertJobs (schema: string, { table, name, returnId = true, noti
       j.start_after,
       "singletonKey",
       CASE
+        -- A caller that knows the slot names it outright: the cron pass files a rule occurrence in
+        -- the slot the occurrence falls in, and an offset off now() cannot pin that, since now()
+        -- here is insert time. Not called singletonOn, which is a column fetching a job hands back,
+        -- so a job read from one queue and inserted into another cannot fill it in by accident.
+        WHEN "singletonSlot" IS NOT NULL THEN CAST("singletonSlot" as timestamp)
         WHEN "singletonSeconds" IS NOT NULL THEN 'epoch'::timestamp + '1s'::interval * ("singletonSeconds"::float8 * floor(( date_part('epoch', now()) + COALESCE("singletonOffset",0)::float8) / "singletonSeconds"::float8 ))
         ELSE NULL
         END as singleton_on,
@@ -1990,6 +1995,7 @@ export function insertJobs (schema: string, { table, name, returnId = true, noti
         "singletonKey" text,
         "singletonSeconds" integer,
         "singletonOffset" integer,
+        "singletonSlot" text,
         "groupId" text,
         "groupTier" text,
         "expireInSeconds" integer,

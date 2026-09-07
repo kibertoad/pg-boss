@@ -1,6 +1,8 @@
 import assert from 'node:assert'
 import { RRuleTemporal } from 'rrule-temporal'
 
+import { assertTimezone } from './timezone.ts'
+
 /**
  * The DTSTART a rule that carries none of its own recurs from.
  *
@@ -14,7 +16,7 @@ import { RRuleTemporal } from 'rrule-temporal'
  * Left floating (no TZID) so the schedule's own `tz` resolves it: the anchor is midnight in the
  * caller's zone rather than midnight in UTC.
  */
-const EPOCH_DTSTART = 'DTSTART:19700101T000000'
+const EPOCH_DTSTART = '19700101T000000'
 
 /**
  * The properties an expression may contain. Anything else is rejected rather than ignored: a
@@ -24,24 +26,63 @@ const EPOCH_DTSTART = 'DTSTART:19700101T000000'
 const PROPERTIES = new Set(['DTSTART', 'RRULE', 'RDATE', 'EXDATE'])
 
 /**
- * The recur rule parts of RFC 5545 3.3.10, plus RSCALE and SKIP from RFC 7529. Unknown parts are
- * rejected for the same reason unknown properties are: `BYHOURS=9` is not an hour of the day to any
- * parser, and evaluating it as `FREQ=DAILY` alone would put the job at midnight without a word.
+ * The recur rule parts of RFC 5545 3.3.10, plus RSCALE and SKIP from RFC 7529, each against the
+ * option rrule-temporal parses it into.
+ *
+ * A part no parser reads is rejected rather than ignored: `BYHOURS=9` is not an hour of the day to
+ * any of them, and evaluating it as `FREQ=DAILY` alone would put the job at midnight without a
+ * word. The option a part lands in is what makes the same mistake in its value visible, since a
+ * value out of range is dropped just as quietly (see assertValues).
  */
-const PARTS = new Set([
-  'FREQ', 'UNTIL', 'COUNT', 'INTERVAL', 'BYSECOND', 'BYMINUTE', 'BYHOUR', 'BYDAY', 'BYMONTHDAY',
-  'BYYEARDAY', 'BYWEEKNO', 'BYMONTH', 'BYSETPOS', 'WKST', 'RSCALE', 'SKIP'
-])
+const PART_OPTIONS: Record<string, string> = {
+  FREQ: 'freq',
+  UNTIL: 'until',
+  COUNT: 'count',
+  INTERVAL: 'interval',
+  BYSECOND: 'bySecond',
+  BYMINUTE: 'byMinute',
+  BYHOUR: 'byHour',
+  BYDAY: 'byDay',
+  BYMONTHDAY: 'byMonthDay',
+  BYYEARDAY: 'byYearDay',
+  BYWEEKNO: 'byWeekNo',
+  BYMONTH: 'byMonth',
+  BYSETPOS: 'bySetPos',
+  WKST: 'wkst',
+  RSCALE: 'rscale',
+  SKIP: 'skip'
+}
 
 /** The property a line names, or nothing at all for a bare recurrence rule. */
 const PROPERTY = /^([a-z][a-z0-9-]*)[;:]/i
 
 /**
- * What tells a recurrence rule from a cron expression: an iCalendar property at the head of the
- * expression, or the FREQ part every RRULE is required to carry. A cron expression has neither, and
- * cannot: no cron field contains `=`.
+ * What tells a recurrence rule from a cron expression: an iCalendar property at the head of a line,
+ * or the FREQ part every RRULE is required to carry. A cron expression has neither, and cannot: no
+ * cron field contains `=`, `:` or `;`.
+ *
+ * Any line, not only the first. A calendar entry pasted in opens with a BEGIN line and one written
+ * by hand may open with anything, and reading those as cron leaves the cron parser reporting
+ * characters it has no name for, when what it was handed is a rule with something specific wrong
+ * with it.
  */
-const RRULE_SHAPE = /^\s*(?:DTSTART|RRULE|RDATE|EXDATE)[;:]|(?:^|[\s;])FREQ=/i
+const RRULE_SHAPE = /^[ \t]*[a-z][a-z0-9-]*[;:]|(?:^|[\s;])FREQ=/im
+
+/**
+ * Rules built on an earlier pass, keyed on the expression and the zone it is evaluated in.
+ *
+ * An RRuleTemporal is immutable: `next()` answers from the options it was constructed with and
+ * caches nothing that depends on its argument, so an instance is good for as long as the expression
+ * is in the schedule table. Building one is roughly a fifth of the cost of evaluating it, and both
+ * halves are synchronous, so a deployment with a lot of rule schedules otherwise pays the parse on
+ * the event loop on every pass.
+ *
+ * Cleared wholesale past CACHE_MAX rather than evicted an entry at a time. The cap is only there so
+ * a deployment that keeps replacing schedules cannot grow it without bound, and a clear costs one
+ * pass rebuilding the rules still in the table, which is what every pass did before it existed.
+ */
+const CACHE = new Map<string, RRuleTemporal>()
+const CACHE_MAX = 1000
 
 /** True if `expression` is a recurrence rule rather than a cron expression. */
 export function isRrule (expression: string): boolean {
@@ -50,17 +91,20 @@ export function isRrule (expression: string): boolean {
 
 /**
  * Rewrites an expression as the iCalendar text rrule-temporal parses, and rejects what it would
- * otherwise read past.
+ * otherwise read past. Answers with the RRULE value as well, which is what assertValues judges.
  *
  * Two shapes reach this: the RRULE property's value on its own (`FREQ=DAILY;BYHOUR=9`), which is
- * what a caller reaching for a cron replacement writes, and the iCalendar block a calendar exports
- * (`DTSTART;TZID=Europe/Berlin:20260901T090000` and an `RRULE:` line, optionally with RDATE and
- * EXDATE). Both end up as the latter.
+ * what a caller reaching for a cron replacement writes, and the DTSTART, RRULE, RDATE and EXDATE
+ * lines of a calendar entry. Both end up as the latter.
  */
-function toIcs (expression: string): string {
+function toIcs (expression: string): { ics: string, rule: string } {
   const lines: string[] = []
 
-  let dtstart = false
+  // The RDATE and EXDATE values, judged once the loop is done: each has to have the same value type
+  // as DTSTART, which may be named on a line below them.
+  const dates: Array<[string, string]> = []
+
+  let dtstart: string | null = null
   let rule: string | null = null
 
   // A line break followed by a space or tab is a fold, not a new property (RFC 5545 3.1), and an
@@ -80,14 +124,21 @@ function toIcs (expression: string): string {
     const name = property || 'RRULE'
     const value = property ? text.slice(text.indexOf(':') + 1) : text
 
+    // A calendar entry is more than its recurrence: an export carries a UID, a SUMMARY, a DTEND and
+    // often a VTIMEZONE block, none of which say anything about when a job should run. Rejected
+    // rather than skipped over, since skipping whatever sits between the BEGIN and END lines is
+    // what would let a mistyped DTSTART through.
+    assert(name !== 'BEGIN' && name !== 'END',
+      'rrule expression should be the DTSTART, RRULE, RDATE and EXDATE lines of a calendar entry, without the BEGIN and END lines around them')
+
     assert(PROPERTIES.has(name),
       `Unsupported property "${name}" in rrule expression. Supported properties: ${[...PROPERTIES].join(', ')}`)
 
     if (name === 'DTSTART') {
       // A second one does not merge with the first, it replaces it, so an expression carrying two
       // has one of them evaluated and the other quietly discarded.
-      assert(!dtstart, 'rrule expression has more than one DTSTART')
-      dtstart = true
+      assert(dtstart === null, 'rrule expression has more than one DTSTART')
+      dtstart = value
     }
 
     if (name === 'RRULE') {
@@ -96,44 +147,145 @@ function toIcs (expression: string): string {
       assertParts(value)
     }
 
+    if (name === 'RDATE' || name === 'EXDATE') {
+      dates.push([name, value])
+    }
+
     lines.push(property ? text : `RRULE:${text}`)
   }
 
-  if (!dtstart) {
+  if (dtstart === null) {
     // COUNT counts from DTSTART, so on the epoch anchor every count worth having is long spent: the
-    // rule parses, has no occurrence left, and the schedule it lands on never sends anything.
-    // Rejected here because a schedule that silently does nothing is the one failure a caller
-    // cannot see.
+    // rule parses, has no occurrence left, and the schedule it lands on never sends anything. Named
+    // here rather than left to the check in assertRrule, which reports the same rule as spent
+    // without saying what would fix it.
     assert(!/(^|;)COUNT=/i.test(rule || ''),
       'rrule expression uses COUNT, which counts occurrences from DTSTART, so it needs a DTSTART of its own')
 
-    lines.unshift(EPOCH_DTSTART)
+    lines.unshift(`DTSTART:${EPOCH_DTSTART}`)
   }
 
-  return lines.join('\n')
+  assertDates(dates, dtstart ?? EPOCH_DTSTART)
+
+  return { ics: lines.join('\n'), rule: rule ?? '' }
 }
 
 /** Rejects a recur rule part no parser reads, which would otherwise change the schedule silently. */
 function assertParts (rule: string): void {
+  const named = new Set<string>()
+
   for (const part of rule.split(';')) {
     if (part.length === 0) {
       continue
     }
 
-    const [name] = part.toUpperCase().split('=')
+    const [name, value = ''] = part.toUpperCase().split('=')
+
+    // A part is NAME=VALUE, and the name on its own passes the allowlist below, so without this the
+    // parser is handed a part with no value and dies inside on it.
+    assert(value.length > 0, `rrule part "${part}" has no value`)
 
     // X- names are the extension mechanism RFC 5545 3.3.10 leaves open, so they are passed through
     // to the parser rather than judged here.
-    assert(PARTS.has(name) || name.startsWith('X-'), `Unsupported part "${part}" in rrule expression`)
+    assert(name in PART_OPTIONS || name.startsWith('X-'), `Unsupported part "${part}" in rrule expression`)
+
+    // RFC 5545 3.3.10 gives a part one appearance. A second does not widen the first, it replaces
+    // it, so `BYHOUR=9;BYHOUR=17` is a schedule that skips the morning without a word.
+    assert(!named.has(name), `rrule expression has more than one ${name} part`)
+
+    named.add(name)
   }
 }
 
-function buildRule (expression: string, tz: string): RRuleTemporal {
+/**
+ * Rejects an RDATE or EXDATE whose value type differs from DTSTART's.
+ *
+ * RFC 5545 3.8.5 requires the two to match, and a caller feels the mismatch: a date on its own has
+ * no time of day, so rrule-temporal reads `EXDATE;VALUE=DATE:20261224` as midnight and sends the
+ * 09:00 occurrence it was meant to exclude anyway. The parser reports the same mismatch for UNTIL
+ * and not for these, and a holiday nobody excluded is a job at a time somebody ruled out, so it is
+ * reported here.
+ */
+function assertDates (dates: Array<[string, string]>, dtstart: string): void {
+  // A date time carries the T of RFC 5545 3.3.5; a date on its own is eight digits.
+  const dtstartIsDate = !dtstart.includes('T')
+
+  for (const [name, value] of dates) {
+    for (const date of value.split(',')) {
+      // The value it should have been, so the message says what to write rather than only what is
+      // wrong with what was written.
+      const expected = dtstartIsDate ? `a date such as ${date.slice(0, 8)}` : `a date time such as ${date}T090000`
+
+      assert(date.includes('T') !== dtstartIsDate,
+        `rrule ${name} "${date}" must have the same value type as DTSTART: ${expected}`)
+    }
+  }
+}
+
+/**
+ * Rejects a part value the parser read past, which is the same silent wrong time an unknown part
+ * name would be.
+ *
+ * rrule-temporal reports a value no reading of RFC 5545 allows (BYDAY=XX, INTERVAL=0) and drops one
+ * that is merely out of range: `BYHOUR=25` leaves the rule with no BYHOUR at all, so the job runs at
+ * the anchor's midnight rather than the hour it names, and `BYHOUR=9,25` keeps nine and loses the
+ * second send of the day. Both show up in the options the rule was built with, which hold either
+ * nothing for the part or fewer values than it was given.
+ */
+function assertValues (rule: string, built: RRuleTemporal): void {
+  const options: Record<string, unknown> = { ...built.options() }
+
+  for (const part of rule.split(';')) {
+    const [name, value = ''] = part.split('=')
+    const option = PART_OPTIONS[name.toUpperCase()]
+
+    // An X- part has nothing to be compared against: the extension namespace is passed through to
+    // the parser, which carries it in none of its options. Any other name assertParts has already
+    // rejected.
+    if (option === undefined) {
+      continue
+    }
+
+    const parsed = options[option]
+    const message = `Unsupported value in rrule part "${part}"`
+
+    assert(parsed !== undefined, message)
+
+    // A list keeps the values it could read and drops the rest, so the count is what shows one went
+    // missing. Against the distinct values given, since the parser collapses a repeat.
+    if (Array.isArray(parsed)) {
+      assert(parsed.length === new Set(value.toUpperCase().split(',')).size, message)
+    }
+  }
+}
+
+function buildRule (ics: string, tz: string): RRuleTemporal {
   // strict enforces the combinations RFC 5545 3.3.10 forbids outright (BYMONTHDAY with a weekly
   // frequency, an ordinal BYDAY on anything but a monthly or yearly one). Without it a rule that no
   // two engines would agree on is evaluated anyway, and a schedule fires at a time its author has
   // no way to predict.
-  return new RRuleTemporal({ rruleString: toIcs(expression), tzid: tz, strict: true })
+  return new RRuleTemporal({ rruleString: ics, tzid: tz, strict: true })
+}
+
+/** The rule `expression` evaluates to in `tz`, built once and kept for the passes that follow. */
+function cachedRule (expression: string, tz: string): RRuleTemporal {
+  // Both halves, since one expression on two schedules in two zones is two rules. Separated by a
+  // line break, which a zone name cannot contain.
+  const key = `${tz}\n${expression}`
+
+  let rule = CACHE.get(key)
+
+  if (rule === undefined) {
+    rule = buildRule(toIcs(expression).ics, tz)
+
+    if (CACHE.size >= CACHE_MAX) {
+      CACHE.clear()
+    }
+
+    CACHE.set(key, rule)
+  }
+
+  return rule
 }
 
 /**
@@ -145,7 +297,7 @@ function buildRule (expression: string, tz: string): RRuleTemporal {
  * same schedule.
  */
 export function nextOccurrence (expression: string, after: Date, tz: string): Date | null {
-  const occurrence = buildRule(expression, tz).next(after)
+  const occurrence = cachedRule(expression, tz).next(after)
 
   // The cron pass compares occurrences against a Date, so the nanoseconds a Temporal instant
   // carries have nowhere to go. Nothing is lost: an iCalendar DTSTART is second-precision, and
@@ -155,19 +307,24 @@ export function nextOccurrence (expression: string, after: Date, tz: string): Da
 
 /**
  * Rejects an expression or time zone `schedule()` should not store, so a schedule that cannot be
- * evaluated is reported to the caller rather than to a warning on every later pass.
+ * evaluated, or would never send anything, is reported to the caller rather than to a warning on
+ * every later pass.
  */
 export function assertRrule (expression: string, tz: string): void {
-  // The expression first, against a zone known to be usable, so a bad expression reports as one
-  // rather than as a time zone problem.
-  buildRule(expression, 'UTC')
+  const { ics, rule } = toIcs(expression)
 
-  try {
-    buildRule(expression, tz)
-  } catch {
-    // The expression has already parsed once, so the zone is the only thing left to blame. Reported
-    // in the same words cron scheduling uses for the same mistake, rather than as the uppercased
-    // "Invalid time zone specified" a Temporal implementation throws.
-    throw new Error(`Unknown or unsupported time zone: "${tz}"`)
-  }
+  // The expression against a zone known to be usable, so a caller who got both wrong hears about
+  // the rule, which is the order the cron path judges its two in as well.
+  assertValues(rule, buildRule(ics, 'UTC'))
+
+  // Judged on its own rather than inferred from a second build in the caller's zone: rrule-temporal
+  // ignores the zone it is handed whenever DTSTART names one, so that build reports nothing for the
+  // expressions most likely to name a zone at all.
+  assertTimezone(tz)
+
+  // A rule with nothing left to send is the one failure a caller cannot see: the row sits in the
+  // table, every pass evaluates it, and no job is ever sent. A spent COUNT and a passed UNTIL both
+  // land here. In the schedule's own zone, since that is the one the pass evaluates.
+  assert(nextOccurrence(expression, new Date(), tz) !== null,
+    'rrule expression has no occurrence left, so the schedule would never send a job')
 }
