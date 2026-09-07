@@ -76,13 +76,13 @@ export interface SchedulingOptions {
    * handlers are: the parser lives in the process, only the expression is stored, and an instance
    * with no parser for a stored kind leaves those schedules to an instance that has one.
    *
-   * `cron` is built in and cannot be replaced.
+   * `cron` and `rrule` are built in and cannot be replaced.
    *
    * @example
    * const boss = new PgBoss({
    *   connectionString,
    *   recurrences: {
-   *     rrule: {
+   *     quartz: {
    *       next: (expression, after, tz) => myEngine.after(expression, after, tz),
    *       validate: (expression, tz) => myEngine.parse(expression, tz)
    *     }
@@ -140,7 +140,7 @@ export type RecurrenceParsers = Record<string, RecurrenceParser>
 
 /** A recurrence expression together with the kind of parser that evaluates it. */
 export interface Recurrence {
-  /** `cron`, or a kind registered through the `recurrences` constructor option. */
+  /** `cron`, `rrule`, or a kind registered through the `recurrences` constructor option. */
   kind: string;
   expression: string;
 }
@@ -1019,7 +1019,7 @@ export interface Request {
 export interface Schedule {
   name: string;
   key: string;
-  /** `cron`, or a kind registered through the `recurrences` constructor option. */
+  /** `cron`, `rrule`, or a kind registered through the `recurrences` constructor option. */
   kind: string;
   /**
    * The recurrence expression. Stored in the `cron` column whatever the kind, which is why both

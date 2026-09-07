@@ -1088,7 +1088,7 @@ describe('timekeeper occurrences', function () {
   it('schedule() rejects a kind with no registered parser', async function () {
     const tk = makeTk(0)
 
-    await expect(tk.schedule('q', { kind: 'rrule', expression: 'FREQ=DAILY' })).rejects.toThrow(/Unknown recurrence kind "rrule"/)
+    await expect(tk.schedule('q', { kind: 'quartz', expression: '0 0 12 ? * MON' })).rejects.toThrow(/Unknown recurrence kind "quartz"/)
   })
 
   it('schedule() rejects an unknown missed policy', async function () {
@@ -1101,19 +1101,19 @@ describe('timekeeper occurrences', function () {
   it('schedule() runs a registered parser validate() and rejects what it throws on', async function () {
     const tk = makeTk(0, {
       recurrences: {
-        rrule: {
+        quartz: {
           next: (_e: string, after: Date) => new Date(after.getTime() + 60_000),
           validate: (expression: string) => {
-            if (!expression.startsWith('FREQ=')) {
-              throw new Error('not an RRULE')
+            if (!expression.startsWith('0 ')) {
+              throw new Error('not a quartz expression')
             }
           }
         }
       }
     })
 
-    await expect(tk.schedule('q', { kind: 'rrule', expression: 'nope' })).rejects.toThrow('not an RRULE')
-    await expect(tk.schedule('q', { kind: 'rrule', expression: 'FREQ=DAILY' })).resolves.toBeUndefined()
+    await expect(tk.schedule('q', { kind: 'quartz', expression: 'nope' })).rejects.toThrow('not a quartz expression')
+    await expect(tk.schedule('q', { kind: 'quartz', expression: '0 0 12 ? * MON' })).resolves.toBeUndefined()
   })
 
   it('a parser that answers with something other than a date is treated as a broken schedule', async function () {
@@ -1272,7 +1272,7 @@ describe('timekeeper occurrences', function () {
 
   it('warns about a due schedule whose kind this instance cannot evaluate', async function () {
     const state: FakeState = {
-      unsupported: [{ name: 'q', key: 'weekly', kind: 'rrule', expression: 'FREQ=WEEKLY' }]
+      unsupported: [{ name: 'q', key: 'weekly', kind: 'quartz', expression: '0 0 12 ? * MON' }]
     }
     const tk = makeTk(0, {}, state)
 
@@ -1282,7 +1282,7 @@ describe('timekeeper occurrences', function () {
     await tk.cron()
 
     expect(warnings.length).toBe(1)
-    expect(warnings[0].message).toMatch(/recurrence kind "rrule"/)
+    expect(warnings[0].message).toMatch(/recurrence kind "quartz"/)
     // nothing is claimed or advanced: the row is left for an instance that has the parser
     expect(state.writes!.length).toBe(0)
 

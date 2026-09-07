@@ -97,13 +97,13 @@ The following options can be set as properties in an object for additional confi
 
 * **recurrences**, object
 
-  Recurrence parsers this instance can evaluate, keyed by kind. `cron` is built in and cannot be replaced. See [Scheduling](./scheduling.md#recurrence-kinds).
+  Recurrence parsers this instance can evaluate, keyed by kind. `cron` and [`rrule`](./scheduling.md#rrule-expressions) are built in and cannot be replaced. See [Scheduling](./scheduling.md#recurrence-kinds).
 
   ```js
   const boss = new PgBoss({
     connectionString,
     recurrences: {
-      rrule: {
+      quartz: {
         next: (expression, after, tz) => myEngine.after(expression, after, tz),
         validate: (expression, tz) => myEngine.parse(expression, tz)
       }

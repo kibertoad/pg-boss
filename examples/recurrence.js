@@ -3,8 +3,8 @@ import * as helper from '../test/testHelper.ts'
 
 // A recurrence kind registered by this process. pg-boss stores the kind and the expression; the
 // parser stays here, the same way a work() handler does. This one reads the expression as a plain
-// number of seconds, but the same shape fits an RRULE engine or anything else that can answer
-// "what is the next occurrence after this instant".
+// number of seconds, but the same shape fits any engine that can answer "what is the next
+// occurrence after this instant". Two kinds need no registration at all: cron and rrule.
 const everyNSeconds = {
   next: (expression, after) => new Date(after.getTime() + Number(expression) * 1000),
   validate: (expression) => {
@@ -30,9 +30,13 @@ async function recurrence () {
 
   await boss.schedule(queue, { kind: 'seconds', expression: '10' }, { arg1: 'schedule me' }, { missed: 'once' })
 
-  const [schedule] = await boss.getSchedules(queue)
+  // The rrule kind ships with pg-boss, so it takes an RFC 5545 recurrence rule with nothing
+  // registered. Every fifteen seconds, on the quarter minute.
+  await boss.schedule(queue, { kind: 'rrule', expression: 'FREQ=SECONDLY;INTERVAL=15' }, { arg1: 'rrule' }, { key: 'rrule' })
 
-  console.log(`${schedule.kind} schedule "${schedule.expression}" is next due ${schedule.nextRunAt.toISOString()}`)
+  for (const schedule of await boss.getSchedules(queue)) {
+    console.log(`${schedule.kind} schedule "${schedule.expression}" is next due ${schedule.nextRunAt.toISOString()}`)
+  }
 
   await boss.work(queue, async ([job]) => {
     console.log(`received job ${job.id} with data ${JSON.stringify(job.data)} on ${new Date().toISOString()}`)

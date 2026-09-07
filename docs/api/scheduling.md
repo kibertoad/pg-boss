@@ -20,25 +20,23 @@ To disable scheduling on an instance completely, use the following in the constr
 
 ## Recurrence kinds
 
-The expression on a schedule is evaluated by a parser, named by its `kind`. `cron` is built in; every other kind is registered on the constructor, in the same way `work()` handlers are registered:
+The expression on a schedule is evaluated by a parser, named by its `kind`. `cron` and [`rrule`](#rrule-expressions) are built in; every other kind is registered on the constructor, in the same way `work()` handlers are registered:
 
 ```js
-import { RRule } from 'rrule'
-
 const boss = new PgBoss({
   connectionString,
   recurrences: {
-    rrule: {
+    quartz: {
       // The first occurrence strictly after `after`, or null when there is no further occurrence.
-      next: (expression, after, tz) => RRule.fromString(expression).after(after),
+      next: (expression, after, tz) => myEngine.after(expression, after, tz),
       // Optional. Throw to reject the expression at schedule() time.
-      validate: (expression, tz) => RRule.fromString(expression)
+      validate: (expression, tz) => myEngine.parse(expression, tz)
     }
   }
 })
 
 await boss.schedule('run-workflow',
-  { kind: 'rrule', expression: 'DTSTART;TZID=Europe/Berlin:20260901T090000\nRRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR' },
+  { kind: 'quartz', expression: '0 0 12 ? * MON' },
   { workflowId },
   { key: workflowId, missed: 'once' }
 )
@@ -49,6 +47,8 @@ Parsers are pure functions that pg-boss calls; they are never stored or serializ
 Only one instance runs a scheduling pass per `cronMonitorIntervalSeconds`, so an instance without the parser would otherwise spend the pass on a row it cannot evaluate and leave the occurrence to age out of the grace window. When a pass finds a due schedule of a kind it cannot evaluate, it releases the pass so the next instance to tick can try, and an instance that does have the parser gets there while the occurrence is still on time.
 
 The expression is stored in the `cron` column whatever the kind, and `getSchedules()` reports it as both `cron` and `expression`.
+
+A built-in kind cannot be replaced by a registered parser. A stored kind has to mean the same thing on every instance, and a deployment where half the processes read `rrule` with one engine and half with another would send the same schedule at different times depending on which one ran the pass. A different engine goes under a kind name of its own.
 
 ## Cron expressions
 
@@ -67,6 +67,49 @@ but **not** this format which is parsed as "only run exactly at 3:30:30 am every
 ```
 
 For more cron documentation and examples see the docs for the [cron-parser package](https://www.npmjs.com/package/cron-parser).
+
+## RRULE expressions
+
+The `rrule` kind takes a recurrence rule as defined in [RFC 5545](https://datatracker.ietf.org/doc/html/rfc5545#section-3.3.10), evaluated by [rrule-temporal](https://www.npmjs.com/package/rrule-temporal). It covers the schedules cron cannot express: the last Friday of the month, every second Monday, a rule that stops on a date or after a number of runs.
+
+```js
+await boss.schedule('report',
+  { kind: 'rrule', expression: 'FREQ=MONTHLY;BYDAY=-1FR;BYHOUR=17' },
+  null,
+  { tz: 'America/Chicago' }
+)
+```
+
+The expression is either the rule on its own, as above, or the iCalendar block a calendar exports, with a `DTSTART` line and optional `RDATE` and `EXDATE` lines:
+
+```js
+await boss.schedule('standup', {
+  kind: 'rrule',
+  expression: [
+    'DTSTART;TZID=Europe/Berlin:20260901T090000',
+    'RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR',
+    'EXDATE;TZID=Europe/Berlin:20261224T090000'
+  ].join('\n')
+})
+```
+
+* **Time zone**
+
+  `DTSTART` decides it when it names one, as `DTSTART;TZID=Europe/Berlin:20260901T090000` does. Otherwise the schedule's `tz` option does, so `FREQ=DAILY;BYHOUR=9` with `tz: 'America/Chicago'` runs at nine in Chicago, across daylight saving transitions.
+
+* **DTSTART**
+
+  A rule that carries no `DTSTART` is anchored on 1970-01-01T00:00:00 in the schedule's time zone. That anchor is what an `INTERVAL` counts from, so `FREQ=HOURLY;INTERVAL=6` runs at 00:00, 06:00, 12:00 and 18:00 the way the equivalent cron expression would, and it is the same anchor in every instance and every release. Supply a `DTSTART` to choose the phase yourself. `COUNT` is rejected without one, since counting from the epoch leaves a rule with nothing left to send.
+
+* **Finite rules**
+
+  `UNTIL` and `COUNT` are honored. Once the last occurrence has been sent, `nextRunAt` is null and the schedule stays in the table without firing again.
+
+* **Resolution**
+
+  Occurrences finer than a minute are sent as the rule says, so `FREQ=SECONDLY;INTERVAL=15` gets every 15 seconds, each pass sending whatever came due since the last one.
+
+`schedule()` validates the expression, so a rule that would be read differently than it was meant is rejected before it reaches the table: an unknown part such as `BYHOURS=9`, an unknown property, a second `DTSTART` or `RRULE`, and the combinations RFC 5545 forbids outright, such as `BYMONTHDAY` with a weekly frequency.
 
 ## Missed occurrences
 
@@ -97,7 +140,7 @@ Schedules a job to be sent to the specified queue on a recurring expression. If 
 **Arguments**
 
 - `name`: string, *required*
-- `recurrence`: string or object, *required*. A cron expression, or `{ kind, expression }` for a registered recurrence kind
+- `recurrence`: string or object, *required*. A cron expression, or `{ kind, expression }` for [`rrule`](#rrule-expressions) or a registered recurrence kind
 - `data`: object
 - `options`: object
 

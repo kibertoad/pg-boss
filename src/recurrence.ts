@@ -1,12 +1,13 @@
 import assert from 'node:assert'
 import { CronExpressionParser } from 'cron-parser'
 import { CRON_KIND } from './plans.ts'
+import { RRULE_KIND, rruleRecurrence } from './rrule.ts'
 import type * as types from './types.ts'
 
-// The one recurrence kind pg-boss implements itself. Everything else arrives through the
+// The recurrence kinds pg-boss implements itself. Everything else arrives through the
 // `recurrences` constructor option, the same way work() handlers arrive through the process
 // rather than the database.
-export { CRON_KIND }
+export { CRON_KIND, RRULE_KIND }
 
 /**
  * Asserts that `tz` is a time zone cron evaluation can actually use.
@@ -47,6 +48,17 @@ export const cronRecurrence: types.RecurrenceParser = {
 }
 
 /**
+ * The kinds every instance can evaluate without being handed a parser. Both ship with pg-boss, so
+ * neither may be replaced by a registered one: a stored kind has to mean the same thing on every
+ * instance, and a deployment where half the processes read `rrule` with one engine and half with
+ * another would send the same schedule at different times depending on which one ran the pass.
+ */
+const BUILT_IN: types.RecurrenceParsers = {
+  [CRON_KIND]: cronRecurrence,
+  [RRULE_KIND]: rruleRecurrence
+}
+
+/**
  * Validates the `recurrences` constructor option. Called from the config resolver so a
  * malformed parser is a constructor error, not a surprise on the first cron pass.
  */
@@ -57,8 +69,8 @@ export function assertRecurrenceConfig (recurrences: unknown): void {
   for (const [kind, parser] of Object.entries(recurrences as Record<string, unknown>)) {
     assert(kind.length > 0, 'configuration assert: a recurrence kind cannot be an empty string')
 
-    assert(kind !== CRON_KIND,
-      `configuration assert: "${CRON_KIND}" is built in and cannot be replaced by a registered parser`)
+    assert(!Object.hasOwn(BUILT_IN, kind),
+      `configuration assert: "${kind}" is built in and cannot be replaced by a registered parser`)
 
     assert(typeof parser === 'object' && parser !== null,
       `configuration assert: recurrence "${kind}" must be an object with a next() function`)
@@ -73,10 +85,10 @@ export function assertRecurrenceConfig (recurrences: unknown): void {
   }
 }
 
-/** The kinds this process can evaluate: the built-in cron parser plus whatever was registered. */
+/** The kinds this process can evaluate: the built-in parsers plus whatever was registered. */
 export function resolveRecurrences (recurrences?: types.RecurrenceParsers): Map<string, types.RecurrenceParser> {
   return new Map<string, types.RecurrenceParser>([
-    [CRON_KIND, cronRecurrence],
+    ...Object.entries(BUILT_IN),
     ...Object.entries(recurrences || {})
   ])
 }

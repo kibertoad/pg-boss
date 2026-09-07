@@ -148,7 +148,7 @@ describe('recurrence kinds', function () {
     // A row an instance elsewhere in the deployment wrote, with a parser this one does not have.
     await execute(
       `INSERT INTO ${ctx.schema}.schedule (name, key, kind, cron, timezone, data, options, next_run_at)
-       VALUES ($1, '', 'rrule', 'FREQ=WEEKLY', 'UTC', null, '{}'::jsonb, now() - interval '1 minute')`,
+       VALUES ($1, '', 'quartz', '0 0 12 ? * MON', 'UTC', null, '{}'::jsonb, now() - interval '1 minute')`,
       [ctx.schema]
     )
 
@@ -162,7 +162,7 @@ describe('recurrence kinds', function () {
     }
 
     expect(warnings.length).toBeGreaterThanOrEqual(1)
-    expect(warnings[0].message).toMatch(/recurrence kind "rrule"/)
+    expect(warnings[0].message).toMatch(/recurrence kind "quartz"/)
 
     // Untouched, so an instance that does have the parser still finds the occurrence waiting, the
     // way a queue with no work() handler is simply not fetched.
@@ -203,7 +203,7 @@ describe('recurrence kinds', function () {
   it('rejects a kind with no registered parser at schedule() time', async function () {
     ctx.boss = await helper.start(ctx.bossConfig)
 
-    await expect(ctx.boss.schedule(ctx.schema, { kind: 'rrule', expression: 'FREQ=DAILY' }))
+    await expect(ctx.boss.schedule(ctx.schema, { kind: 'quartz', expression: '0 0 12 * * ?' }))
       .rejects.toThrow(/Unknown recurrence kind/)
   })
 
@@ -241,7 +241,7 @@ describe('recurrence kinds', function () {
 
   it('rejects a parser with no next function', async function () {
     // the parser shape is typed, so a parser with no next() is only reachable from JavaScript
-    const recurrences = { rrule: { validate: () => {} } } as any
+    const recurrences = { quartz: { validate: () => {} } } as any
 
     expect(() => new PgBoss({ ...ctx.bossConfig, recurrences }))
       .toThrow(/next\(expression, after, tz\)/)
