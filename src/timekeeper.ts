@@ -4,6 +4,7 @@ import EventEmitter from 'node:events'
 import * as Attorney from './attorney.ts'
 import type Manager from './manager.ts'
 import * as plans from './plans.ts'
+import { isRrule, nextOccurrence, assertRrule } from './rrule.ts'
 import { delay } from './tools.ts'
 import * as types from './types.ts'
 import { emitAndPersistWarning, type WarningContext } from './warning.ts'
@@ -28,6 +29,16 @@ const WARNING_TYPES = {
   CLOCK_SKEW: 'clock_skew',
   INVALID_SCHEDULE: 'invalid_schedule'
 } as const
+
+// How long an occurrence stays due, and the width of the throttle slot a forwarded job is filed in.
+// One value because the two have to agree: a window wider than the slot lets two slots claim the
+// same occurrence and send it twice, and a slot wider than the window collapses two occurrences a
+// window apart into one job.
+const OCCURRENCE_WINDOW_SECONDS = 60
+
+// singleton_offset is an internal column of the insert path rather than a documented send option,
+// so the forwarded job widens JobInsert here rather than the type widening for everyone.
+type ForwardedJob = types.JobInsert & { singletonOffset?: number }
 
 /**
  * Asserts that `tz` is a time zone cron evaluation can actually use.
@@ -211,14 +222,18 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
   async cron () {
     const schedules = await this.getSchedules()
 
-    const scheduled: types.JobInsert[] = []
+    const scheduled: ForwardedJob[] = []
     const stillBroken = new Set<string>()
 
+    // One instant for the whole pass, so every schedule is judged against the same clock and the
+    // throttle slot of a forwarded job is measured from the same place its occurrence was.
+    const databaseTime = this.databaseNow()
+
     for (const { name, key, data, options, cron, timezone } of schedules) {
-      let due: boolean
+      let occurrence: Date | null
 
       try {
-        due = this.shouldSendIt(cron, timezone)
+        occurrence = this.dueOccurrence(cron, timezone, databaseTime)
       } catch (err) {
         // Evaluating one row must not decide the fate of the others. schedule() now rejects an
         // unusable time zone, but a row written by an earlier release — or straight into the table —
@@ -242,8 +257,22 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
         continue
       }
 
-      if (due) {
-        scheduled.push({ data: { name, data, options }, singletonKey: `${name}__${key}`, singletonSeconds: 60 })
+      if (occurrence) {
+        scheduled.push({
+          data: { name, data, options },
+          singletonKey: `${name}__${key}`,
+          singletonSeconds: OCCURRENCE_WINDOW_SECONDS,
+          // A recurrence rule can put an occurrence anywhere in the minute, and a slot measured
+          // from insert time would then straddle it: two passes on either side of a slot boundary
+          // both find the occurrence inside the window and file it in a slot of their own, sending
+          // it twice. The offset pins the slot to the occurrence instead, rounded up so the shifted
+          // instant lands on or just after it rather than in the slot before.
+          //
+          // Only for a rule. A cron occurrence is left in the slot every release has always filed
+          // it in, since an instance still running an older one during a rolling upgrade computes
+          // that slot and nothing else, and a slot the two disagree on collapses nothing.
+          ...(isRrule(cron) ? { singletonOffset: Math.ceil((occurrence.getTime() - databaseTime) / 1000) } : {})
+        })
       }
     }
 
@@ -255,15 +284,40 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
   }
 
   shouldSendIt (cron: string, tz: string) {
-    const databaseTime = Date.now() + this.clockSkew
+    return this.dueOccurrence(cron, tz) !== null
+  }
 
-    const interval = CronExpressionParser.parse(cron, { tz, strict: false, currentDate: new Date(databaseTime) })
+  /** The database's clock, as this instance last measured it. */
+  private databaseNow (): number {
+    return Date.now() + this.clockSkew
+  }
 
-    const prevTime = interval.prev()
+  /**
+   * The occurrence a schedule has come due for, or null if it has not.
+   *
+   * Due means "an occurrence in the last minute", whatever the pass interval: a pass runs every
+   * `cronMonitorIntervalSeconds` (30 by default), so the window has to be wide enough that an
+   * occurrence is still due when the next pass reaches it, and the throttle slot of the forwarded
+   * job is what keeps the passes that follow from sending it a second time.
+   */
+  private dueOccurrence (expression: string, tz: string, databaseTime = this.databaseNow()): Date | null {
+    if (isRrule(expression)) {
+      // Asked forwards from the start of the window rather than backwards from now: a rule with an
+      // exhausted COUNT or a passed UNTIL has no occurrence behind it to find, and every engine
+      // optimizes the forward direction.
+      const window = new Date(databaseTime - OCCURRENCE_WINDOW_SECONDS * 1000)
+      const occurrence = nextOccurrence(expression, window, tz)
 
-    const prevDiff = (databaseTime - prevTime.getTime()) / 1000
+      return (occurrence !== null && occurrence.getTime() <= databaseTime) ? occurrence : null
+    }
 
-    return prevDiff < 60
+    const interval = CronExpressionParser.parse(expression, { tz, strict: false, currentDate: new Date(databaseTime) })
+
+    const previous = interval.prev().toDate()
+
+    const previousDiff = (databaseTime - previous.getTime()) / 1000
+
+    return previousDiff < OCCURRENCE_WINDOW_SECONDS ? previous : null
   }
 
   private async onSendIt (jobs: types.Job<types.Request>[]): Promise<void> {
@@ -297,12 +351,16 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
   async schedule (name: string, cron: string, data?: unknown, options: types.ScheduleOptions = {}): Promise<void> {
     const { tz = 'UTC', key = '', ...rest } = options
 
-    // Expression first, so a bad expression reports as one rather than as a time zone problem. The
-    // check is deliberately run against UTC rather than the supplied tz: it only works today
-    // because cron-parser is lazy about an unusable zone, and if that ever changes this call would
-    // throw the opaque "CronDate: unhandled timestamp" that assertTimezone exists to replace.
-    CronExpressionParser.parse(cron, { tz: 'UTC', strict: false })
-    assertTimezone(tz)
+    if (isRrule(cron)) {
+      assertRrule(cron, tz)
+    } else {
+      // Expression first, so a bad expression reports as one rather than as a time zone problem. The
+      // check is deliberately run against UTC rather than the supplied tz: it only works today
+      // because cron-parser is lazy about an unusable zone, and if that ever changes this call would
+      // throw the opaque "CronDate: unhandled timestamp" that assertTimezone exists to replace.
+      CronExpressionParser.parse(cron, { tz: 'UTC', strict: false })
+      assertTimezone(tz)
+    }
 
     Attorney.checkSendArgs([name, data, { ...rest }])
     Attorney.assertKey(key)

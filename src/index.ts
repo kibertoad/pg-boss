@@ -507,6 +507,10 @@ export class PgBoss extends EventEmitter<types.PgBossEventMap> {
     return this.#contractor.detectDrift()
   }
 
+  /**
+   * Schedules a job on a recurring expression: a cron expression, or an RFC 5545 recurrence rule
+   * such as `FREQ=MONTHLY;BYDAY=-1FR;BYHOUR=17`.
+   */
   schedule (name: string, cron: string, data?: object | null, options?: types.ScheduleOptions): Promise<void> {
     return this.#timekeeper.schedule(name, cron, data, options)
   }

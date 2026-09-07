@@ -932,6 +932,7 @@ export interface Request {
 export interface Schedule {
   name: string;
   key: string;
+  /** The cron expression or recurrence rule this schedule recurs on. */
   cron: string;
   timezone: string;
   data?: object;
