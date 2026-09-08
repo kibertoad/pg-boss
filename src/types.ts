@@ -929,9 +929,14 @@ export interface Request {
   options?: SendOptions;
 }
 
+/** Which format a schedule's expression is in. */
+export type ScheduleKind = 'cron' | 'rrule'
+
 export interface Schedule {
   name: string;
   key: string;
+  /** Which of the two formats `cron` holds, decided by `schedule()` and stored on the row. */
+  kind: ScheduleKind;
   /** The cron expression or recurrence rule this schedule recurs on. */
   cron: string;
   timezone: string;

@@ -67,6 +67,10 @@ await boss.schedule('standup', [
 
   Schedules are checked every 30 seconds against the minute an occurrence falls in, so a rule finer than a minute, such as `FREQ=SECONDLY` or a `BYSECOND` list, sends at most one job a minute. This is the same limitation the 6-placeholder cron format has, and for the same reason.
 
+* **Stored format**
+
+  `schedule()` decides which format an expression is in, once, and stores the answer in the schedule table's `kind` column (`cron` or `rrule`); `getSchedules()` returns it. Every pass reads the expression the way that column says, so the format cannot be settled one way at validation and another way later. A row written straight into the table with SQL has to name its own kind, since the column defaults to `cron`, which is what every schedule stored before rules existed is.
+
 A rule is understood by any instance running a release that supports one. During a rolling upgrade an instance still on an older release reads the expression as cron, cannot parse it, and reports an [`invalid_schedule`](./events.md#warning) warning until it is replaced, so rule schedules are best added once the deployment is upgraded.
 
 `schedule()` validates the expression, so a rule that would be read differently than it was meant is rejected before it reaches the table:
@@ -135,11 +139,13 @@ await boss.unschedule('report', 'eu')
 
 Returns all scheduled jobs.
 
+Each schedule carries the expression in `cron`, the format it is in as `kind` (`cron` or `rrule`), the time zone it is evaluated in, and the `data` and `options` its jobs are sent with.
+
 ```js
 const schedules = await boss.getSchedules()
 
 for (const schedule of schedules) {
-  console.log(`${schedule.name} (${schedule.key}): ${schedule.cron} ${schedule.timezone}`)
+  console.log(`${schedule.name} (${schedule.key}): ${schedule.kind} ${schedule.cron} ${schedule.timezone}`)
 }
 ```
 

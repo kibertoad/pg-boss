@@ -41,12 +41,6 @@ const OCCURRENCE_WINDOW_SECONDS = 60
 // the forwarded job widens JobInsert here rather than the type widening for everyone.
 type ForwardedJob = types.JobInsert & { singletonSlot?: string }
 
-// What evaluating one schedule answers with: the occurrence it has come due for, if any, and
-// whether the expression it came from is a recurrence rule, which is what decides the throttle slot
-// the forwarded job is filed in. Both in one value because both come of reading the expression
-// once, and a second reading is a second chance for the two to disagree.
-type DueOccurrence = { occurrence: Date | null, rule: boolean }
-
 /**
  * The throttle slot an instant falls in, as the timestamp the insert files a job under.
  *
@@ -228,11 +222,11 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
     // throttle slot of a forwarded job is measured from the same place its occurrence was.
     const databaseTime = this.databaseNow()
 
-    for (const { name, key, data, options, cron, timezone } of schedules) {
-      let due: DueOccurrence
+    for (const { name, key, data, options, kind, cron, timezone } of schedules) {
+      let occurrence: Date | null
 
       try {
-        due = this.dueOccurrence(cron, timezone, databaseTime)
+        occurrence = this.dueOccurrence(cron, kind, timezone, databaseTime)
       } catch (err) {
         // Evaluating one row must not decide the fate of the others. schedule() now rejects an
         // unusable time zone, but a row written by an earlier release — or straight into the table —
@@ -256,7 +250,7 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
         continue
       }
 
-      if (due.occurrence) {
+      if (occurrence) {
         scheduled.push({
           data: { name, data, options },
           singletonKey: `${name}__${key}`,
@@ -271,8 +265,8 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
           // A cron occurrence keeps the slot every release has always filed it in, since an
           // instance still running an older one during a rolling upgrade computes that slot and
           // nothing else, and a slot the two disagree on collapses nothing.
-          ...(due.rule
-            ? { singletonSlot: throttleSlot(due.occurrence) }
+          ...(kind === plans.SCHEDULE_KINDS.rrule
+            ? { singletonSlot: throttleSlot(occurrence) }
             : { singletonSeconds: OCCURRENCE_WINDOW_SECONDS })
         })
       }
@@ -285,8 +279,8 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
     }
   }
 
-  shouldSendIt (cron: string, tz: string) {
-    return this.dueOccurrence(cron, tz).occurrence !== null
+  shouldSendIt (expression: string, tz: string, kind: types.ScheduleKind = plans.SCHEDULE_KINDS.cron) {
+    return this.dueOccurrence(expression, kind, tz) !== null
   }
 
   /** The database's clock, as this instance last measured it. */
@@ -295,25 +289,26 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
   }
 
   /**
-   * The occurrence a schedule has come due for, or null if it has not, and which of the two
-   * expression formats produced it.
+   * The occurrence a schedule has come due for, or null if it has not.
+   *
+   * `kind` says how to read the expression, and comes off the schedule row: the format was settled
+   * when the schedule was written, so a pass reads the expression the one way its author meant it
+   * rather than guessing again every 30 seconds.
    *
    * Due means "an occurrence in the last minute", whatever the pass interval: a pass runs every
    * `cronMonitorIntervalSeconds` (30 by default), so the window has to be wide enough that an
    * occurrence is still due when the next pass reaches it, and the throttle slot of the forwarded
    * job is what keeps the passes that follow from sending it a second time.
    */
-  private dueOccurrence (expression: string, tz: string, databaseTime = this.databaseNow()): DueOccurrence {
-    const rule = isRrule(expression)
-
-    if (rule) {
+  private dueOccurrence (expression: string, kind: types.ScheduleKind, tz: string, databaseTime = this.databaseNow()): Date | null {
+    if (kind === plans.SCHEDULE_KINDS.rrule) {
       // Asked forwards from the start of the window rather than backwards from now: a rule with an
       // exhausted COUNT or a passed UNTIL has no occurrence behind it to find, and every engine
       // optimizes the forward direction.
       const window = new Date(databaseTime - OCCURRENCE_WINDOW_SECONDS * 1000)
       const occurrence = nextOccurrence(expression, window, tz)
 
-      return { occurrence: (occurrence !== null && occurrence.getTime() <= databaseTime) ? occurrence : null, rule }
+      return (occurrence !== null && occurrence.getTime() <= databaseTime) ? occurrence : null
     }
 
     const interval = CronExpressionParser.parse(expression, { tz, strict: false, currentDate: new Date(databaseTime) })
@@ -322,7 +317,7 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
 
     const previousDiff = (databaseTime - previous.getTime()) / 1000
 
-    return { occurrence: previousDiff < OCCURRENCE_WINDOW_SECONDS ? previous : null, rule }
+    return previousDiff < OCCURRENCE_WINDOW_SECONDS ? previous : null
   }
 
   private async onSendIt (jobs: types.Job<types.Request>[]): Promise<void> {
@@ -356,7 +351,12 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
   async schedule (name: string, cron: string, data?: unknown, options: types.ScheduleOptions = {}): Promise<void> {
     const { tz = 'UTC', key = '', ...rest } = options
 
-    if (isRrule(cron)) {
+    // The one place the format of an expression is decided. Every reader takes it from the stored
+    // kind instead, so a schedule cannot be validated as one format and later evaluated as the
+    // other, and a row can say what it is without anyone parsing it.
+    const kind: types.ScheduleKind = isRrule(cron) ? plans.SCHEDULE_KINDS.rrule : plans.SCHEDULE_KINDS.cron
+
+    if (kind === plans.SCHEDULE_KINDS.rrule) {
       assertRrule(cron, tz)
     } else {
       // Expression first, so a bad expression reports as one rather than as a time zone problem. The
@@ -372,7 +372,7 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
 
     try {
       const sql = plans.schedule(this.config.schema)
-      await this.db.executeSql(sql, [name, key, cron, tz, data, options])
+      await this.db.executeSql(sql, [name, key, kind, cron, tz, data, options])
     } catch (err: any) {
       if (err.message.includes('foreign key')) {
         err.message = `Queue ${name} not found`

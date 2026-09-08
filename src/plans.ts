@@ -63,6 +63,22 @@ export const QUEUE_POLICIES = Object.freeze({
   key_strict_fifo: 'key_strict_fifo'
 })
 
+/**
+ * How the expression in a schedule row is read: a cron expression, or an RFC 5545 recurrence rule.
+ *
+ * Stored on the row rather than derived from the expression on every pass, so the format is decided
+ * once, by whoever writes the schedule, and every reader agrees with that decision. A row written
+ * straight into the table with SQL has to name its own kind; the column defaults to cron, which is
+ * what every schedule written before rules existed is.
+ */
+export const SCHEDULE_KINDS = Object.freeze({
+  cron: 'cron',
+  rrule: 'rrule'
+} as const)
+
+/** The kind column's domain, for the CHECK on the table and the migration that adds it. */
+export const SCHEDULE_KIND_CHECK = `kind IN ('${SCHEDULE_KINDS.cron}', '${SCHEDULE_KINDS.rrule}')`
+
 const QUEUE_DEFAULTS = {
   expire_seconds: FIFTEEN_MINUTES,
   retention_seconds: FORTEEN_DAYS,
@@ -219,11 +235,15 @@ function createTableQueue (schema: string) {
   `
 }
 
+// `cron` holds the expression whatever its format, and `kind` says which format that is: the column
+// predates rules and renaming it would break every consumer reading the table, from the dashboard to
+// a hand-written query.
 function createTableSchedule (schema: string) {
   return `
     CREATE TABLE ${schema}.schedule (
       name text REFERENCES ${schema}.queue ON DELETE CASCADE,
       key text not null DEFAULT '',
+      kind text not null DEFAULT '${SCHEDULE_KINDS.cron}' CHECK (${SCHEDULE_KIND_CHECK}),
       cron text not null,
       timezone text,
       data jsonb,
@@ -1081,9 +1101,10 @@ export function getSchedulesByQueueAndKey (schema: string) {
 
 export function schedule (schema: string) {
   return `
-    INSERT INTO ${schema}.schedule (name, key, cron, timezone, data, options)
-    VALUES ($1, $2, $3, $4, $5, $6)
+    INSERT INTO ${schema}.schedule (name, key, kind, cron, timezone, data, options)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
     ON CONFLICT (name, key) DO UPDATE SET
+      kind = EXCLUDED.kind,
       cron = EXCLUDED.cron,
       timezone = EXCLUDED.timezone,
       data = EXCLUDED.data,

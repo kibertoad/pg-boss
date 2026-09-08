@@ -310,18 +310,18 @@ describe('rrule', function () {
 
     // a minutely rule: the previous boundary is always less than 60s before database time, whatever
     // the skew, exactly as the equivalent cron expression behaves
-    expect(tk.shouldSendIt('FREQ=MINUTELY', 'UTC')).toBe(true)
-    expect(tk.shouldSendIt('FREQ=SECONDLY;INTERVAL=15', 'UTC')).toBe(true)
+    expect(tk.shouldSendIt('FREQ=MINUTELY', 'UTC', 'rrule')).toBe(true)
+    expect(tk.shouldSendIt('FREQ=SECONDLY;INTERVAL=15', 'UTC', 'rrule')).toBe(true)
   })
 
   it('does not fire a rule with no occurrence in the window', function () {
     const tk = makeTk()
 
     // finished: the last occurrence is years back
-    expect(tk.shouldSendIt('DTSTART:20200101T000000Z\nRRULE:FREQ=DAILY;UNTIL=20200201T000000Z', 'UTC')).toBe(false)
+    expect(tk.shouldSendIt('DTSTART:20200101T000000Z\nRRULE:FREQ=DAILY;UNTIL=20200201T000000Z', 'UTC', 'rrule')).toBe(false)
 
     // not started: the first occurrence is years out
-    expect(tk.shouldSendIt('DTSTART:20991231T000000Z\nRRULE:FREQ=DAILY', 'UTC')).toBe(false)
+    expect(tk.shouldSendIt('DTSTART:20991231T000000Z\nRRULE:FREQ=DAILY', 'UTC', 'rrule')).toBe(false)
   })
 
   it('files a rule occurrence in the throttle slot the occurrence falls in, not the one insert time does', async function () {
@@ -334,8 +334,8 @@ describe('rrule', function () {
     // Occurrences on the half minute, so two passes can find the same one inside the window from
     // opposite sides of a slot boundary.
     ;(tk as any).getSchedules = async () => ([
-      { name: 'rule', key: '', data: null, options: {}, cron: 'FREQ=MINUTELY;BYSECOND=30', timezone: 'UTC' },
-      { name: 'cron', key: '', data: null, options: {}, cron: '* * * * *', timezone: 'UTC' }
+      { name: 'rule', key: '', data: null, options: {}, kind: 'rrule', cron: 'FREQ=MINUTELY;BYSECOND=30', timezone: 'UTC' },
+      { name: 'cron', key: '', data: null, options: {}, kind: 'cron', cron: '* * * * *', timezone: 'UTC' }
     ])
 
     // The most recent occurrence, which the skew below places the database clock relative to. Both
@@ -403,8 +403,47 @@ describe('rrule', function () {
 
     const [schedule] = await ctx.boss.getSchedules()
 
+    expect(schedule.kind).toBe('rrule')
     expect(schedule.cron).toBe('FREQ=MINUTELY')
     expect(schedule.timezone).toBe('UTC')
+  })
+
+  it('records which format a schedule is in, and rewrites it when the expression is replaced', async function () {
+    ctx.boss = await helper.start(ctx.bossConfig)
+
+    const kindOf = async () => (await ctx.boss!.getSchedules(ctx.schema, 'nightly'))[0].kind
+
+    await ctx.boss.schedule(ctx.schema, '0 3 * * *', null, { key: 'nightly' })
+    expect(await kindOf()).toBe('cron')
+
+    // Replacing the expression on a key that already exists has to carry the format with it, or the
+    // row keeps the kind of the expression it no longer holds and every later pass reads it wrong.
+    await ctx.boss.schedule(ctx.schema, 'FREQ=DAILY;BYHOUR=3', null, { key: 'nightly' })
+    expect(await kindOf()).toBe('rrule')
+
+    await ctx.boss.schedule(ctx.schema, '0 3 * * *', null, { key: 'nightly' })
+    expect(await kindOf()).toBe('cron')
+  })
+
+  it('reads an expression as the kind on its row rather than judging it again', async function () {
+    const tk = makeTk()
+    ;(tk as any).stopped = false
+    ;(tk as any).manager = { insert: async () => {} }
+
+    // What a row written straight into the table with SQL looks like when it names no kind, and
+    // what an instance on an older release writes during a rolling upgrade: the column defaults to
+    // cron, so the rule in it is read as a cron expression and reported rather than evaluated.
+    ;(tk as any).getSchedules = async () => ([
+      { name: 'mislabeled', key: '', data: null, options: {}, kind: 'cron', cron: 'FREQ=MINUTELY', timezone: 'UTC' }
+    ])
+
+    const warnings: any[] = []
+    tk.on('warning', (w: any) => warnings.push(w))
+
+    await tk.cron()
+
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0].message).toMatch(/mislabeled/)
   })
 
   it('refuses an unusable rule at schedule() time rather than storing it', async function () {

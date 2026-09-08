@@ -1591,6 +1591,22 @@ function getAll (schema: string, noPartitioning = false, noCovering = false): ty
         `ALTER TABLE ${schema}.queue DROP COLUMN monitor_claim_on`,
         `ALTER TABLE ${schema}.version DROP COLUMN monitor_backoff_on`
       ]
+    },
+    {
+      release: '12.31.0',
+      version: 41,
+      previous: 40,
+      // Every row already in the table is a cron expression, since that was the only format a
+      // schedule could hold, so the column default states it and the ADD COLUMN writes it to each
+      // existing row. No UPDATE needed, and none wanted: a non-volatile default is metadata-only
+      // in postgres 11+, so the backfill costs nothing however many schedules are stored.
+      install: [
+        `ALTER TABLE ${schema}.schedule ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT '${plans.SCHEDULE_KINDS.cron}' CHECK (${plans.SCHEDULE_KIND_CHECK})`
+      ],
+      // Drops the CHECK with it, since the constraint belongs to the column.
+      uninstall: [
+        `ALTER TABLE ${schema}.schedule DROP COLUMN kind`
+      ]
     }
   ]
 }
