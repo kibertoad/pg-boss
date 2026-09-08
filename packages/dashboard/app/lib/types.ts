@@ -54,7 +54,7 @@ export type JobResult =
     'groupId' | 'groupTier' | 'deadLetter' | 'policy'
   >>
 
-export type WarningType = 'slow_query' | 'queue_backlog' | 'clock_skew'
+export type WarningType = 'slow_query' | 'queue_backlog' | 'clock_skew' | 'listen_notify_unavailable' | 'invalid_schedule' | 'index_bloat' | 'xmin_horizon' | 'autovacuum_disabled' | 'monitor_backoff'
 
 export interface WarningResult {
   id: number;
@@ -116,4 +116,16 @@ export interface BamStatusSummary {
 export interface ScheduleResult extends Schedule {
   createdOn: Date;
   updatedOn: Date;
+}
+
+// The subset of a database configuration that is safe to send to the browser.
+// `DatabaseConfig` in config.server.ts also carries `url`, a connection string
+// with a password in it, and that must never reach a loader payload — React
+// Router serializes those into the HTML for hydration, where anyone who can
+// load the page can read them. The schema name is not a credential and the
+// database selector displays it, so it stays.
+export interface PublicDatabase {
+  id: string;
+  name: string;
+  schema: string;
 }

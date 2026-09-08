@@ -342,8 +342,15 @@ export type HttpGetQueueStatsResponse = {
   result: HttpQueueStats[]
 }
 
+export type HttpIndexBloatOptions = types.IndexBloatOptions
+
+export type HttpReindexOptions = types.ReindexOptions
+
+export type HttpSuperviseOptions = types.SuperviseOptions
+
 export type HttpSuperviseRequest = {
   name?: HttpQueueName
+  options?: HttpSuperviseOptions
 }
 
 export type HttpSuperviseResponse = HttpSubscribeResponse
@@ -387,6 +394,11 @@ export type HttpGetScheduleResponse = {
 export type HttpPreviewScheduleResponse = {
   ok: true
   result: Date[]
+}
+
+export type HttpGetReindexCommandsResponse = {
+  ok: true
+  result: string[]
 }
 
 export type HttpGetBamStatusResponse = {

@@ -14,6 +14,44 @@ A web-based dashboard is available in the [`@pg-boss/dashboard`](https://www.npm
 - **Mobile Responsive**: Full functionality on mobile devices with collapsible sidebar
 - **Shareable URLs**: Database selection and filters are preserved in URLs for easy sharing
 
+## Pages
+
+### Overview
+
+Landing page with aggregate counts across all queues (queued, deferred, ready, active, failed and total jobs), the top queues by backlog with a ready-count trend sparkline and status badge, and the most recent warnings. The **Send Job** button opens a form to enqueue a job into any queue.
+
+![Overview page](./images/dashboard-overview.png)
+
+### Jobs
+
+Recently created jobs across all queues. Filter by job ID, queue, state (pending, created, retry, active, completed, cancelled or failed) and minimum retry count, or open the advanced filters to match on keys inside the job's `data` or `output` JSON. **Manage view** lets you add custom columns sourced from job fields (for example `data.tenantId`), and **Copy link** produces a shareable URL with the current filters and columns. Clicking a job opens its detail page with the full payload, output, retry and timing metadata, and cancel / retry / resume / delete actions.
+
+![Jobs page](./images/dashboard-jobs.png)
+
+### Queues
+
+Every queue in the schema with its policy and cached counts (queued, deferred, ready, active, failed, total), a trend sparkline, storage mode (shared or partitioned) and a status badge (idle, processing or backlogged). Columns are sortable and the list can be searched by name. **Create Queue** creates a new queue with its policy and retry / expiration / retention options. Clicking a queue opens its detail page with configuration, a 24-hour ready-count history and the jobs in that queue.
+
+![Queues page](./images/dashboard-queues.png)
+
+### Schedules
+
+Cron-based schedules registered with `boss.schedule()`, showing the target queue, optional key, cron expression, a human-readable frequency, the next occurrence and timezone. **Schedule Job** creates a new schedule, and each schedule's detail page shows its data and options and lets you unschedule it.
+
+![Schedules page](./images/dashboard-schedules.png)
+
+### Migrations
+
+Status of background async migrations (BAM) — schema changes such as concurrent index builds that pg-boss runs outside the install transaction. Shows pending, in-progress, completed and failed counts, and for each command its version, target table, timestamps and the SQL that was (or will be) executed, including any error message.
+
+![Migrations page](./images/dashboard-migrations.png)
+
+### Warnings
+
+Event log of warnings emitted by pg-boss when [`persistWarnings`](#enabling-warning-persistence) is enabled, such as slow queries, queue backlogs or clock skew. Each entry shows its type, message, key details (for example the queue and its size, or the query duration) and time, and the list can be filtered by warning type.
+
+![Warnings page](./images/dashboard-warnings.png)
+
 ## Requirements
 
 - Node.js 22.12+
@@ -47,6 +85,7 @@ The dashboard is configured via environment variables:
 | `PORT` | Server port | `3000` |
 | `PGBOSS_DASHBOARD_AUTH_USERNAME` | Basic auth username (optional) | - |
 | `PGBOSS_DASHBOARD_AUTH_PASSWORD` | Basic auth password (optional) | - |
+| `PGBOSS_DASHBOARD_READ_ONLY` | Set to `1` to disable every mutating action (see [Read-only mode](#read-only-mode)) | - |
 | `PGBOSS_DASHBOARD_BASE_PATH` | Sub-path to serve the dashboard under, e.g. `/pgboss` (build-time only, see [Serving under a sub-path](#serving-under-a-sub-path)) | `/` |
 | `PGBOSS_DASHBOARD_QUERY_TIMEOUT` | Max milliseconds per dashboard query before server-side cancellation (`statement_timeout`). Requires a restart to change. | `60000` |
 
@@ -62,6 +101,23 @@ npx pg-boss-dashboard
 ```
 
 Both variables must be provided together. If only one is set, the dashboard will throw an error on startup.
+
+### Read-only mode
+
+Set `PGBOSS_DASHBOARD_READ_ONLY=1` to serve the dashboard as a viewer:
+
+```bash
+PGBOSS_DASHBOARD_READ_ONLY=1 \
+DATABASE_URL="postgres://localhost/mydb" \
+npx pg-boss-dashboard
+```
+
+Every page still loads and every query still runs. What changes:
+
+- The server rejects every non-`GET`/`HEAD` request with `403`, so sending, retrying, cancelling, resuming, deleting, creating queues, and scheduling are all refused — including a request crafted by hand.
+- The controls for those actions are not rendered, and `/send`, `/queues/create`, and `/schedules/new` explain themselves instead of showing a form.
+
+This is a global switch rather than a permission system: everyone who can reach the dashboard sees the same read-only view. It is independent of basic authentication and can be combined with it.
 
 ### Multi-Database Configuration
 
@@ -194,10 +250,18 @@ const boss = new PgBoss({
 });
 ```
 
-Warnings correlate to `warning` events already emitted by pg-boss:
+Warnings correlate to [`warning`](./api/events.md#warning) events already emitted by pg-boss:
 - `slow_query`: Queries taking longer than expected
 - `queue_backlog`: Queues exceeding their warning threshold
 - `clock_skew`: Database clock drift detection
+- `listen_notify_unavailable`: `useListenNotify` is on but no listener could be established
+- `invalid_schedule`: A stored schedule could not be evaluated and was skipped
+- `index_bloat`: A job index holds far more pages than its live entries need and was not rebuilt
+- `xmin_horizon`: Something is pinning the MVCC horizon, so vacuum reclaims nothing
+- `autovacuum_disabled`: Nothing is vacuuming a job table at all
+- `monitor_backoff`: The queue-stats aggregate was deferred to keep autovacuum moving
+
+A warning type written by a newer pg-boss core than the dashboard is displayed under its raw name.
 
 ## Tech Stack
 

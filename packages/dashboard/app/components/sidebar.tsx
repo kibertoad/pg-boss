@@ -1,9 +1,12 @@
 import { NavLink, useRouteLoaderData, useSearchParams, useNavigate, useLocation } from 'react-router'
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { createPortal } from 'react-dom'
+import overlay from '~pro'
+import { ProSlot } from '~/components/pro-slot'
 import { ThemeToggle } from '~/components/ui/theme-toggle'
 import { ColorThemePicker } from '~/components/ui/color-theme-picker'
 import { cn } from '~/lib/utils'
+import type { PublicDatabase } from '~/lib/types'
 import {
   Sidebar,
   SidebarContent,
@@ -17,16 +20,9 @@ import {
   useSidebar,
 } from '~/components/ui/sidebar'
 
-interface DatabaseConfig {
-  id: string
-  name: string
-  url: string
-  schema: string
-}
-
 interface RootLoaderData {
-  databases: DatabaseConfig[]
-  currentDb: DatabaseConfig
+  databases: PublicDatabase[]
+  currentDb: PublicDatabase
 }
 
 const navigation = [
@@ -36,6 +32,7 @@ const navigation = [
   { name: 'Schedules', href: '/schedules', icon: SchedulesIcon },
   { name: 'Migrations', href: '/migrations', icon: MigrationsIcon },
   { name: 'Warnings', href: '/warnings', icon: WarningIcon },
+  ...overlay.nav,
 ]
 
 function HomeIcon ({ className }: { className?: string }) {
@@ -107,9 +104,9 @@ function DatabaseSelector ({
   currentDb,
   onSelect,
 }: {
-  databases: DatabaseConfig[]
-  currentDb: DatabaseConfig
-  onSelect: (db: DatabaseConfig) => void
+  databases: PublicDatabase[]
+  currentDb: PublicDatabase
+  onSelect: (db: PublicDatabase) => void
 }) {
   const [isOpen, setIsOpen] = useState(false)
   const buttonRef = useRef<HTMLButtonElement>(null)
@@ -218,7 +215,7 @@ export function AppSidebar () {
   const currentDb = rootData?.currentDb
   const dbParam = searchParams.get('db')
 
-  const handleDatabaseSelect = (db: DatabaseConfig) => {
+  const handleDatabaseSelect = (db: PublicDatabase) => {
     const params = new URLSearchParams(searchParams)
     if (db.id === databases[0]?.id) {
       params.delete('db')
@@ -286,6 +283,7 @@ export function AppSidebar () {
       </SidebarContent>
 
       <SidebarFooter>
+        <ProSlot name="sidebarFooter" />
         <div className="flex flex-col px-2">
           <p className="px-2 mb-1 text-xs font-medium text-sidebar-foreground/50 uppercase tracking-wider group-data-[state=collapsed]:hidden">Theme</p>
           <ThemeToggle />
