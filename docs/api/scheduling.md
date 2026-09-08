@@ -65,11 +65,13 @@ await boss.schedule('standup', [
 
 * **Resolution**
 
-  Schedules are checked every 30 seconds against the minute an occurrence falls in, so a rule finer than a minute, such as `FREQ=SECONDLY` or a `BYSECOND` list, sends at most one job a minute. This is the same limitation the 6-placeholder cron format has, and for the same reason.
+  Schedules are checked every 30 seconds, and a job is filed under the minute its occurrence falls in, so a rule finer than a minute, such as `FREQ=SECONDLY` or a `BYSECOND` list, sends one job for each minute that holds an occurrence. This is the same limitation the 6-placeholder cron format has, and for the same reason. Two occurrences in separate minutes both send, however close together they are: an `RDATE` seconds before one of an hourly rule's own occurrences produces two jobs, not one.
 
 * **Stored format**
 
   `schedule()` decides which format an expression is in, once, and stores the answer in the schedule table's `kind` column (`cron` or `rrule`); `getSchedules()` returns it. Every pass reads the expression the way that column says, so the format cannot be settled one way at validation and another way later. A row written straight into the table with SQL has to name its own kind, since the column defaults to `cron`, which is what every schedule stored before rules existed is.
+
+  The column is a hint rather than a verdict. When an expression cannot be read the way the column says, and is written the other way, the pass reads it the way it is written and corrects the column. So a row that has lost its label, to a schema rollback and re-upgrade or to an upsert from an instance too old to know the column, keeps firing instead of sitting there looking valid.
 
 A rule is understood by any instance running a release that supports one. During a rolling upgrade an instance still on an older release reads the expression as cron, cannot parse it, and reports an [`invalid_schedule`](./events.md#warning) warning until it is replaced, so rule schedules are best added once the deployment is upgraded.
 

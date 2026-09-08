@@ -1596,12 +1596,21 @@ function getAll (schema: string, noPartitioning = false, noCovering = false): ty
       release: '12.31.0',
       version: 41,
       previous: 40,
-      // Every row already in the table is a cron expression, since that was the only format a
-      // schedule could hold, so the column default states it and the ADD COLUMN writes it to each
-      // existing row. No UPDATE needed, and none wanted: a non-volatile default is metadata-only
-      // in postgres 11+, so the backfill costs nothing however many schedules are stored.
+      // The default labels every row cron, which is what a table this migration has never seen
+      // holds: cron was the only format a schedule could be written in. The UPDATE is for the table
+      // it has seen before. `uninstall` drops the column rather than remembering it, so a rollback
+      // to v40 and a re-upgrade would otherwise relabel every rule as cron from the default and
+      // leave a row that reads fine and never fires. Reading the expression puts the label back.
+      //
+      // The two patterns are the detection isRrule() performs, in the terms both postgres and
+      // CockroachDB's regexp engine share: `^` anchors the whole string in one and not the other, so
+      // a property on a line below the first is matched on the whitespace before it instead. No cron
+      // expression matches either, and cannot, since no cron field contains `=`, `:` or `;`.
       install: [
-        `ALTER TABLE ${schema}.schedule ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT '${plans.SCHEDULE_KINDS.cron}' CHECK (${plans.SCHEDULE_KIND_CHECK})`
+        `ALTER TABLE ${schema}.schedule ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT '${plans.SCHEDULE_KINDS.cron}' CHECK (${plans.SCHEDULE_KIND_CHECK})`,
+        `UPDATE ${schema}.schedule SET kind = '${plans.SCHEDULE_KINDS.rrule}'
+          WHERE kind = '${plans.SCHEDULE_KINDS.cron}'
+            AND (cron ~* '(^|[[:space:]]|;)FREQ=' OR cron ~* '(^|[[:space:]])(DTSTART|RRULE|RDATE|EXDATE)[;:]')`
       ],
       // Drops the CHECK with it, since the constraint belongs to the column.
       uninstall: [

@@ -1099,6 +1099,22 @@ export function getSchedulesByQueueAndKey (schema: string) {
   return `SELECT * FROM ${schema}.schedule WHERE name = $1 AND COALESCE(key, '') = $2`
 }
 
+/**
+ * Relabels the kind of one or more schedules, as the cron pass does when a row's stored kind
+ * disagrees with the expression beside it.
+ *
+ * `updated_on` is deliberately untouched: it tracks edits to the definition, and a relabel is the
+ * pass agreeing with what the row already said, not a change to what the schedule does.
+ */
+export function setScheduleKinds (schema: string) {
+  return `
+    UPDATE ${schema}.schedule s SET kind = k.kind
+    FROM json_to_recordset($1::json) as k (name text, key text, kind text)
+    WHERE s.name = k.name
+      AND COALESCE(s.key, '') = k.key
+  `
+}
+
 export function schedule (schema: string) {
   return `
     INSERT INTO ${schema}.schedule (name, key, kind, cron, timezone, data, options)
@@ -1977,9 +1993,12 @@ export function insertJobs (schema: string, { table, name, returnId = true, noti
       CASE
         -- A caller that knows the slot names it outright: the cron pass files a rule occurrence in
         -- the slot the occurrence falls in, and an offset off now() cannot pin that, since now()
-        -- here is insert time. Not called singletonOn, which is a column fetching a job hands back,
-        -- so a job read from one queue and inserted into another cannot fill it in by accident.
-        WHEN "singletonSlot" IS NOT NULL THEN CAST("singletonSlot" as timestamp)
+        -- here is insert time. Prefixed because insert() stringifies caller objects straight into
+        -- the recordset below, so an ordinary name would be a live, undeclared and unvalidated
+        -- option on the public path, where a bad value surfaces as a raw postgres error. Not called
+        -- singletonOn either, which is a column fetching a job hands back, so a job read from one
+        -- queue and inserted into another cannot fill it in by accident.
+        WHEN "__singletonSlot" IS NOT NULL THEN CAST("__singletonSlot" as timestamp)
         WHEN "singletonSeconds" IS NOT NULL THEN 'epoch'::timestamp + '1s'::interval * ("singletonSeconds"::float8 * floor(( date_part('epoch', now()) + COALESCE("singletonOffset",0)::float8) / "singletonSeconds"::float8 ))
         ELSE NULL
         END as singleton_on,
@@ -2016,7 +2035,7 @@ export function insertJobs (schema: string, { table, name, returnId = true, noti
         "singletonKey" text,
         "singletonSeconds" integer,
         "singletonOffset" integer,
-        "singletonSlot" text,
+        "__singletonSlot" text,
         "groupId" text,
         "groupTier" text,
         "expireInSeconds" integer,

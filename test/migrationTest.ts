@@ -795,7 +795,7 @@ describe('migration', function () {
     expect(uninstall.some(c => /DROP INDEX IF EXISTS .*job_i5/.test(c))).toBe(false)
   })
 
-  itPostgresOnly('labels every schedule stored before v41 as cron', async function () {
+  itPostgresOnly('labels every schedule stored before v41 from the expression on it', async function () {
     const schema = ctx.bossConfig.schema
     const db = await getDb()
 
@@ -803,18 +803,32 @@ describe('migration', function () {
       await contractor.create()
       await db.executeSql(`SELECT ${schema}.create_queue('sched_q', '{"policy":"standard"}'::jsonb)`)
 
-      // A row written while cron was the only format a schedule could hold, which is every row any
-      // database upgrading to v41 already has.
       await rollbackTo(40)
-      await db.executeSql(
-        `INSERT INTO ${schema}.schedule (name, key, cron, timezone) VALUES ('sched_q', $1, '0 3 * * *', 'UTC')`,
-        ['nightly'])
+
+      const store = (key: string, cron: string) => db.executeSql(
+        `INSERT INTO ${schema}.schedule (name, key, cron, timezone) VALUES ('sched_q', $1, $2, 'UTC')`,
+        [key, cron])
+
+      // A row written while cron was the only format a schedule could hold, which is every row a
+      // database upgrading to v41 for the first time holds.
+      await store('nightly', '0 3 * * *')
+
+      // And the rows a rollback to v40 leaves behind, which dropping the column took the format of.
+      // The default alone would label these cron, and the pass would then read a rule as a cron
+      // expression and warn about it every 30 seconds instead of firing it. Both the bare rule and
+      // the property at the head of a line are matched, the second on a line below the first.
+      await store('rule', 'FREQ=DAILY;BYHOUR=3')
+      await store('block', 'DTSTART:20260901T090000Z\nRRULE:FREQ=WEEKLY;BYDAY=MO')
 
       await contractor.migrate(40)
       expect(await contractor.schemaVersion()).toBe(currentSchemaVersion)
 
-      const { rows } = await db.executeSql(`SELECT key, kind FROM ${schema}.schedule`)
-      expect(rows).toEqual([{ key: 'nightly', kind: 'cron' }])
+      const { rows } = await db.executeSql(`SELECT key, kind FROM ${schema}.schedule ORDER BY key`)
+      expect(rows).toEqual([
+        { key: 'block', kind: 'rrule' },
+        { key: 'nightly', kind: 'cron' },
+        { key: 'rule', kind: 'rrule' }
+      ])
 
       // And the kind a row cannot be: the column carries the two formats pg-boss evaluates, so a
       // value nothing reads is refused rather than stored and silently treated as cron.

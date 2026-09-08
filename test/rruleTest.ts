@@ -16,13 +16,45 @@ function next (expression: string, tz = 'UTC', after: Date = AFTER): string | nu
 }
 
 // A Timekeeper with a database that only answers the clock query, which is all the pass needs to
-// judge whether a schedule has come due.
+// judge whether a schedule has come due. Every statement it is handed is recorded, since the pass
+// writes as well as reads: a row whose stored kind disagrees with its expression is relabelled.
 function makeTk () {
+  const executed: Array<{ sql: string, params: unknown[] }> = []
+
   const db = {
-    executeSql: async () => ({ rows: [{ time: String(Date.now()) }] })
+    executeSql: async (sql: string, params: unknown[] = []) => {
+      executed.push({ sql, params })
+
+      return { rows: [{ time: String(Date.now()) }] }
+    }
   }
 
-  return new Timekeeper(db as any, {} as any, { schema: 'test' } as any)
+  const tk = new Timekeeper(db as any, {} as any, { schema: 'test' } as any)
+
+  return Object.assign(tk, { executed })
+}
+
+/** The iCalendar spelling of an instant, for a DTSTART or an RDATE built around the clock. */
+function ical (epochMs: number) {
+  return new Date(epochMs).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '')
+}
+
+/**
+ * A pass over `schedules`, with the database clock placed at `databaseTime`, answering with the
+ * jobs it forwarded.
+ */
+async function pass (tk: ReturnType<typeof makeTk>, databaseTime: number, schedules: unknown[]) {
+  const inserted: any[] = []
+
+  ;(tk as any).stopped = false
+  ;(tk as any).manager = { insert: async (_q: string, jobs: any[]) => { inserted.push(...jobs) } }
+  ;(tk as any).getSchedules = async () => schedules
+
+  tk.clockSkew = databaseTime - Date.now()
+
+  await tk.cron()
+
+  return inserted
 }
 
 /**
@@ -356,29 +388,84 @@ describe('rrule', function () {
     // Both passes name the slot the occurrence falls in, so the second job collapses into the first
     // instead of being sent as a job of its own. A slot rather than an offset from the insert's own
     // clock, so nothing the round trip costs can move it.
-    expect(first.singletonSlot).toBe(slotOf(occurrence))
-    expect(second.singletonSlot).toBe(slotOf(occurrence))
+    expect(first.__singletonSlot).toBe(slotOf(occurrence))
+    expect(second.__singletonSlot).toBe(slotOf(occurrence))
     expect(first.singletonSeconds).toBeUndefined()
 
     // A cron occurrence keeps the slot every release has always filed it in: during a rolling
     // upgrade an instance on an older release computes that slot and no other.
     for (const job of inserted.filter(job => job.singletonKey === 'cron__')) {
       expect(job.singletonSeconds).toBe(60)
-      expect(job.singletonSlot).toBeUndefined()
+      expect(job.__singletonSlot).toBeUndefined()
     }
+  })
+
+  it('sends a job for each occurrence that falls inside one window', async function () {
+    const tk = makeTk()
+
+    // The shape a calendar export produces: an hourly rule with a one-off RDATE seconds before one
+    // of its occurrences. The two are closer together than the interval between passes, so no pass
+    // can land between them, and a read answering with a single occurrence drops one of them
+    // whatever direction it reads in.
+    const hour = Math.floor(Date.now() / 3_600_000) * 3_600_000
+    const rdate = hour - 5_000
+
+    const cron = [
+      `DTSTART:${ical(hour - 3_600_000)}`,
+      'RRULE:FREQ=HOURLY',
+      `RDATE:${ical(rdate)}`
+    ].join('\n')
+
+    const inserted = await pass(tk, hour + 1_000, [
+      { name: 'rule', key: '', data: null, options: {}, kind: 'rrule', cron, timezone: 'UTC' }
+    ])
+
+    // Both, each filed in the slot it falls in, so the throttle collapses a repeat of either
+    // without either standing in for the other.
+    expect(inserted.map(job => job.__singletonSlot)).toEqual([slotOf(rdate), slotOf(hour)])
+  })
+
+  it('sends at most one job for the minute an occurrence falls in', async function () {
+    const tk = makeTk()
+
+    // Four occurrences a window, which is the resolution the 6-placeholder cron format has and the
+    // same reason: a job a minute is what the throttle slot allows.
+    const minute = Math.floor(Date.now() / 60_000) * 60_000
+
+    const inserted = await pass(tk, minute + 30_000, [
+      { name: 'rule', key: '', data: null, options: {}, kind: 'rrule', cron: 'FREQ=SECONDLY;INTERVAL=15', timezone: 'UTC' }
+    ])
+
+    // One job for each of the two minutes the window spans, filed under the minute the occurrences
+    // in it belong to rather than the minute the pass ran in.
+    expect(inserted.map(job => job.__singletonSlot)).toEqual([slotOf(minute - 60_000), slotOf(minute)])
   })
 
   it('collapses two jobs filed in one throttle slot and keeps two filed in different slots', async function () {
     ctx.boss = await helper.start(ctx.bossConfig)
 
-    const insert = (singletonSlot: string) =>
-      ctx.boss!.insert(ctx.schema, [{ singletonKey: 'rule__', singletonSlot }] as any, { returnId: true })
+    const insert = (__singletonSlot: string) =>
+      ctx.boss!.insert(ctx.schema, [{ singletonKey: 'rule__', __singletonSlot }] as any, { returnId: true })
 
     // The slot a rule occurrence names, filed twice as two passes on either side of a boundary
     // would file it, then a slot of its own for the occurrence a minute later.
     expect(await insert('2026-09-07 12:00:00')).toHaveLength(1)
     expect(await insert('2026-09-07 12:00:00')).toBeNull()
     expect(await insert('2026-09-07 12:01:00')).toHaveLength(1)
+  })
+
+  it('leaves an unprefixed singletonSlot on the insert() path where it always was: ignored', async function () {
+    ctx.boss = await helper.start(ctx.bossConfig)
+
+    // The slot is an internal field of the cron pass, not a send option, so a caller naming it
+    // unprefixed neither files the job nor reaches the timestamp cast with an unvalidated value.
+    const [id] = await ctx.boss.insert(ctx.schema, [{ singletonSlot: 'not-a-timestamp' }] as any, { returnId: true }) ?? []
+
+    expect(id).toBeTruthy()
+
+    const [job] = await ctx.boss.findJobs(ctx.schema, { id })
+
+    expect(job.singletonOn).toBeNull()
   })
 
   it('sends a job for a schedule created from a recurrence rule', async function () {
@@ -425,25 +512,52 @@ describe('rrule', function () {
     expect(await kindOf()).toBe('cron')
   })
 
-  it('reads an expression as the kind on its row rather than judging it again', async function () {
-    const tk = makeTk()
-    ;(tk as any).stopped = false
-    ;(tk as any).manager = { insert: async () => {} }
+  it('fires a row whose stored kind disagrees with its expression, and relabels it', async function () {
+    // Both directions of the disagreement. A 12.30.x instance's schedule() does not name the
+    // column, so an upsert from one during a rolling upgrade leaves the kind a newer instance
+    // wrote on the expression it has just replaced; a v41 rollback and re-upgrade labels a rule
+    // cron from the column default. Either way the row reads fine and, taking the column as a
+    // verdict, never fires again.
+    for (const [kind, cron] of [['cron', 'FREQ=MINUTELY'], ['rrule', '* * * * *']]) {
+      const tk = makeTk()
 
-    // What a row written straight into the table with SQL looks like when it names no kind, and
-    // what an instance on an older release writes during a rolling upgrade: the column defaults to
-    // cron, so the rule in it is read as a cron expression and reported rather than evaluated.
-    ;(tk as any).getSchedules = async () => ([
-      { name: 'mislabeled', key: '', data: null, options: {}, kind: 'cron', cron: 'FREQ=MINUTELY', timezone: 'UTC' }
-    ])
+      const warnings: any[] = []
+      tk.on('warning', (w: any) => warnings.push(w))
 
-    const warnings: any[] = []
-    tk.on('warning', (w: any) => warnings.push(w))
+      const inserted = await pass(tk, Date.now(), [
+        { name: 'mislabelled', key: 'eu', data: null, options: {}, kind, cron, timezone: 'UTC' }
+      ])
 
-    await tk.cron()
+      expect(inserted).toHaveLength(1)
+      expect(warnings).toHaveLength(0)
 
-    expect(warnings).toHaveLength(1)
-    expect(warnings[0].message).toMatch(/mislabeled/)
+      // and the row is put right, so getSchedules() stops reporting a format the expression is not
+      // in and the next pass reads it without the fallback
+      const relabel = tk.executed.find(({ sql }) => /UPDATE .*schedule .*SET kind/s.test(sql))
+
+      expect(JSON.parse(relabel!.params[0] as string))
+        .toEqual([{ name: 'mislabelled', key: 'eu', kind: kind === 'cron' ? 'rrule' : 'cron' }])
+    }
+  })
+
+  it('warns about an expression that cannot be read either way', async function () {
+    for (const [kind, cron] of [['cron', 'not a cron expression'], ['rrule', 'FREQ=NOPE']]) {
+      const tk = makeTk()
+
+      const warnings: any[] = []
+      tk.on('warning', (w: any) => warnings.push(w))
+
+      const inserted = await pass(tk, Date.now(), [
+        { name: 'broken', key: '', data: null, options: {}, kind, cron, timezone: 'UTC' }
+      ])
+
+      expect(inserted).toHaveLength(0)
+      expect(warnings).toHaveLength(1)
+      expect(warnings[0].message).toMatch(/broken/)
+
+      // nothing to relabel: the expression is what is wrong with the row, not the column
+      expect(tk.executed.some(({ sql }) => /SET kind/.test(sql))).toBe(false)
+    }
   })
 
   it('refuses an unusable rule at schedule() time rather than storing it', async function () {

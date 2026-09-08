@@ -4,7 +4,7 @@ import EventEmitter from 'node:events'
 import * as Attorney from './attorney.ts'
 import type Manager from './manager.ts'
 import * as plans from './plans.ts'
-import { isRrule, nextOccurrence, assertRrule } from './rrule.ts'
+import { isRrule, occurrencesInWindow, assertRrule } from './rrule.ts'
 import { assertTimezone } from './timezone.ts'
 import { delay } from './tools.ts'
 import * as types from './types.ts'
@@ -37,9 +37,14 @@ const WARNING_TYPES = {
 // window apart into one job.
 const OCCURRENCE_WINDOW_SECONDS = 60
 
-// singletonSlot is an internal field of the insert path rather than a documented send option, so
-// the forwarded job widens JobInsert here rather than the type widening for everyone.
-type ForwardedJob = types.JobInsert & { singletonSlot?: string }
+// __singletonSlot is an internal field of the insert path rather than a documented send option, so
+// the forwarded job widens JobInsert here rather than the type widening for everyone. The prefix is
+// what keeps it internal: insert() stringifies caller objects straight into the recordset, so an
+// unprefixed name would be a live, undeclared option on the public path.
+type ForwardedJob = types.JobInsert & { __singletonSlot?: string }
+
+/** What a schedule has come due for, and the format its expression was read in to find out. */
+type DueOccurrences = { kind: types.ScheduleKind, occurrences: Date[] }
 
 /**
  * The throttle slot an instant falls in, as the timestamp the insert files a job under.
@@ -218,15 +223,19 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
     const scheduled: ForwardedJob[] = []
     const stillBroken = new Set<string>()
 
+    // Rows whose stored kind disagrees with the expression on them, as found out by reading the
+    // expression the other way. Relabelled once the pass has sent what it owes.
+    const relabelled: Array<Pick<types.Schedule, 'name' | 'key' | 'kind'>> = []
+
     // One instant for the whole pass, so every schedule is judged against the same clock and the
     // throttle slot of a forwarded job is measured from the same place its occurrence was.
     const databaseTime = this.databaseNow()
 
     for (const { name, key, data, options, kind, cron, timezone } of schedules) {
-      let occurrence: Date | null
+      let due: DueOccurrences
 
       try {
-        occurrence = this.dueOccurrence(cron, kind, timezone, databaseTime)
+        due = this.dueOccurrences(cron, kind, timezone, databaseTime)
       } catch (err) {
         // Evaluating one row must not decide the fate of the others. schedule() now rejects an
         // unusable time zone, but a row written by an earlier release — or straight into the table —
@@ -250,25 +259,32 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
         continue
       }
 
-      if (occurrence) {
-        scheduled.push({
-          data: { name, data, options },
-          singletonKey: `${name}__${key}`,
-          // A recurrence rule can put an occurrence anywhere in the minute, and a slot measured
-          // from insert time would then straddle it: two passes on either side of a slot boundary
-          // both find the occurrence inside the window and file it in a slot of their own, sending
-          // it twice. So a rule occurrence names the slot it falls in outright. An offset from the
-          // insert's own now() would not pin it: everything between reading the clock here and the
-          // insert committing counts towards the shifted instant, which lands in the next slot
-          // whenever that adds up to a boundary crossing.
-          //
-          // A cron occurrence keeps the slot every release has always filed it in, since an
-          // instance still running an older one during a rolling upgrade computes that slot and
-          // nothing else, and a slot the two disagree on collapses nothing.
-          ...(kind === plans.SCHEDULE_KINDS.rrule
-            ? { singletonSlot: throttleSlot(occurrence) }
-            : { singletonSeconds: OCCURRENCE_WINDOW_SECONDS })
-        })
+      if (due.kind !== kind) {
+        relabelled.push({ name, key, kind: due.kind })
+      }
+
+      const forwarded = { data: { name, data, options }, singletonKey: `${name}__${key}` }
+
+      // A recurrence rule can put an occurrence anywhere in the minute, and a slot measured from
+      // insert time would then straddle it: two passes on either side of a slot boundary both find
+      // the occurrence inside the window and file it in a slot of their own, sending it twice. So a
+      // rule occurrence names the slot it falls in outright. An offset from the insert's own now()
+      // would not pin it: everything between reading the clock here and the insert committing
+      // counts towards the shifted instant, which lands in the next slot whenever that adds up to a
+      // boundary crossing.
+      //
+      // One job per slot rather than one per occurrence, which is the resolution the docs promise:
+      // a rule finer than a slot sends a job a slot, and two occurrences inside one window that
+      // fall in slots of their own each send.
+      if (due.kind === plans.SCHEDULE_KINDS.rrule) {
+        for (const slot of new Set(due.occurrences.map(throttleSlot))) {
+          scheduled.push({ ...forwarded, __singletonSlot: slot })
+        }
+      } else if (due.occurrences.length > 0) {
+        // A cron occurrence keeps the slot every release has always filed it in, since an instance
+        // still running an older one during a rolling upgrade computes that slot and nothing else,
+        // and a slot the two disagree on collapses nothing.
+        scheduled.push({ ...forwarded, singletonSeconds: OCCURRENCE_WINDOW_SECONDS })
       }
     }
 
@@ -277,10 +293,17 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
     if (scheduled.length > 0 && !this.stopped) {
       await this.manager.insert(QUEUES.SEND_IT, scheduled)
     }
+
+    // After the sends, so a failed relabel cannot cost an occurrence. Nothing depends on the write:
+    // the fallback in dueOccurrences fires the row either way. What it buys is getSchedules() no
+    // longer reporting a format the expression is not in, and the row leaving that fallback path.
+    if (relabelled.length > 0 && !this.stopped) {
+      await this.db.executeSql(plans.setScheduleKinds(this.config.schema), [JSON.stringify(relabelled)])
+    }
   }
 
   shouldSendIt (expression: string, tz: string, kind: types.ScheduleKind = plans.SCHEDULE_KINDS.cron) {
-    return this.dueOccurrence(expression, kind, tz) !== null
+    return this.dueOccurrences(expression, kind, tz).occurrences.length > 0
   }
 
   /** The database's clock, as this instance last measured it. */
@@ -289,35 +312,61 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
   }
 
   /**
-   * The occurrence a schedule has come due for, or null if it has not.
+   * The occurrences a schedule has come due for, and the format they were read in.
    *
    * `kind` says how to read the expression, and comes off the schedule row: the format was settled
    * when the schedule was written, so a pass reads the expression the one way its author meant it
    * rather than guessing again every 30 seconds.
    *
+   * The column is a hint rather than a verdict, though, because two ordinary upgrade paths leave it
+   * disagreeing with the expression beside it. A 12.30.x instance's `schedule()` does not name the
+   * column, so an upsert from one during a rolling upgrade replaces the expression and leaves
+   * whatever kind a newer instance last wrote; a v41 rollback drops the column, and the re-upgrade
+   * labels every row from its default. Either way the row reads fine and never fires again. So when
+   * an expression cannot be read the way the column says, and is written the other way, it is read
+   * the way it is written: one regex, on a path that was already about to give up.
+   */
+  private dueOccurrences (expression: string, kind: types.ScheduleKind, tz: string, databaseTime = this.databaseNow()): DueOccurrences {
+    try {
+      return { kind, occurrences: this.readOccurrences(expression, kind, tz, databaseTime) }
+    } catch (err) {
+      const detected: types.ScheduleKind = isRrule(expression) ? plans.SCHEDULE_KINDS.rrule : plans.SCHEDULE_KINDS.cron
+
+      // The column and the expression agree, so the expression itself is what is wrong with the row,
+      // and the caller names it in a warning.
+      if (detected === kind) {
+        throw err
+      }
+
+      return { kind: detected, occurrences: this.readOccurrences(expression, detected, tz, databaseTime) }
+    }
+  }
+
+  /**
+   * Every occurrence of an expression inside the due window, read as `kind` says to read it.
+   *
    * Due means "an occurrence in the last minute", whatever the pass interval: a pass runs every
    * `cronMonitorIntervalSeconds` (30 by default), so the window has to be wide enough that an
    * occurrence is still due when the next pass reaches it, and the throttle slot of the forwarded
    * job is what keeps the passes that follow from sending it a second time.
+   *
+   * The window rather than its most recent point, since a rule can put two occurrences inside it
+   * and a read that answers with one of them drops the other. A cron expression cannot: its finest
+   * resolution is a second, and consecutive occurrences a second apart share a throttle slot, so
+   * only the most recent one can produce a job.
    */
-  private dueOccurrence (expression: string, kind: types.ScheduleKind, tz: string, databaseTime = this.databaseNow()): Date | null {
-    if (kind === plans.SCHEDULE_KINDS.rrule) {
-      // Asked forwards from the start of the window rather than backwards from now: a rule with an
-      // exhausted COUNT or a passed UNTIL has no occurrence behind it to find, and every engine
-      // optimizes the forward direction.
-      const window = new Date(databaseTime - OCCURRENCE_WINDOW_SECONDS * 1000)
-      const occurrence = nextOccurrence(expression, window, tz)
+  private readOccurrences (expression: string, kind: types.ScheduleKind, tz: string, databaseTime: number): Date[] {
+    const window = new Date(databaseTime - OCCURRENCE_WINDOW_SECONDS * 1000)
 
-      return (occurrence !== null && occurrence.getTime() <= databaseTime) ? occurrence : null
+    if (kind === plans.SCHEDULE_KINDS.rrule) {
+      return occurrencesInWindow(expression, window, new Date(databaseTime), tz)
     }
 
     const interval = CronExpressionParser.parse(expression, { tz, strict: false, currentDate: new Date(databaseTime) })
 
     const previous = interval.prev().toDate()
 
-    const previousDiff = (databaseTime - previous.getTime()) / 1000
-
-    return previousDiff < OCCURRENCE_WINDOW_SECONDS ? previous : null
+    return previous.getTime() > window.getTime() ? [previous] : []
   }
 
   private async onSendIt (jobs: types.Job<types.Request>[]): Promise<void> {
@@ -357,7 +406,9 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
     const kind: types.ScheduleKind = isRrule(cron) ? plans.SCHEDULE_KINDS.rrule : plans.SCHEDULE_KINDS.cron
 
     if (kind === plans.SCHEDULE_KINDS.rrule) {
-      assertRrule(cron, tz)
+      // From the database's clock, since that is the one the pass reads: a rule whose last
+      // occurrence falls inside the skew window is judged here the way it will be evaluated there.
+      assertRrule(cron, tz, new Date(this.databaseNow()))
     } else {
       // Expression first, so a bad expression reports as one rather than as a time zone problem. The
       // check is deliberately run against UTC rather than the supplied tz: it only works today

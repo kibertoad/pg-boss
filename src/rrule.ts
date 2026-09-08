@@ -1,5 +1,6 @@
 import assert from 'node:assert'
 import { RRuleTemporal } from 'rrule-temporal'
+import { LruMap } from 'toad-cache'
 
 import { assertTimezone } from './timezone.ts'
 
@@ -71,18 +72,16 @@ const RRULE_SHAPE = /^[ \t]*[a-z][a-z0-9-]*[;:]|(?:^|[\s;])FREQ=/im
 /**
  * Rules built on an earlier pass, keyed on the expression and the zone it is evaluated in.
  *
- * An RRuleTemporal is immutable: `next()` answers from the options it was constructed with and
- * caches nothing that depends on its argument, so an instance is good for as long as the expression
- * is in the schedule table. Building one is roughly a fifth of the cost of evaluating it, and both
- * halves are synchronous, so a deployment with a lot of rule schedules otherwise pays the parse on
- * the event loop on every pass.
+ * An RRuleTemporal is immutable: `between()` answers from the options it was constructed with and
+ * caches nothing that depends on its arguments, so an instance is good for as long as the
+ * expression is in the schedule table. Building one is roughly a fifth of the cost of evaluating
+ * it, and both halves are synchronous, so a deployment with a lot of rule schedules otherwise pays
+ * the parse on the event loop on every pass.
  *
- * Cleared wholesale past CACHE_MAX rather than evicted an entry at a time. The cap is only there so
- * a deployment that keeps replacing schedules cannot grow it without bound, and a clear costs one
- * pass rebuilding the rules still in the table, which is what every pass did before it existed.
+ * Least recently used, so the cap costs a deployment that keeps replacing schedules the rules
+ * nobody evaluates any more and leaves the ones every pass reads in place.
  */
-const CACHE = new Map<string, RRuleTemporal>()
-const CACHE_MAX = 1000
+const CACHE = new LruMap<RRuleTemporal>(1000)
 
 /** True if `expression` is a recurrence rule rather than a cron expression. */
 export function isRrule (expression: string): boolean {
@@ -283,10 +282,6 @@ function cachedRule (expression: string, tz: string): RRuleTemporal {
   if (rule === undefined) {
     rule = buildRule(toIcs(expression).ics, tz)
 
-    if (CACHE.size >= CACHE_MAX) {
-      CACHE.clear()
-    }
-
     CACHE.set(key, rule)
   }
 
@@ -304,10 +299,36 @@ function cachedRule (expression: string, tz: string): RRuleTemporal {
 export function nextOccurrence (expression: string, after: Date, tz: string): Date | null {
   const occurrence = cachedRule(expression, tz).next(after)
 
-  // The cron pass compares occurrences against a Date, so the nanoseconds a Temporal instant
-  // carries have nowhere to go. Nothing is lost: an iCalendar DTSTART is second-precision, and
-  // every occurrence is derived from it.
-  return occurrence === null ? null : new Date(occurrence.epochMilliseconds)
+  return occurrence === null ? null : toDate(occurrence)
+}
+
+/**
+ * Every occurrence in `after` to `until`, the lower bound excluded and the upper included, in order.
+ *
+ * The whole window rather than the first occurrence in it, because a rule can put two occurrences
+ * closer together than the interval between passes: a calendar export pairing an hourly rule with
+ * an RDATE seconds before one of its occurrences is the ordinary shape of that. A read answering
+ * with a single point leaves the second of the two visible only while no pass lands between them,
+ * so it is dropped rather than throttled, and reading backwards from now only moves the loss to
+ * the other one.
+ */
+export function occurrencesInWindow (expression: string, after: Date, until: Date, tz: string): Date[] {
+  // between() excludes both ends. Excluding the lower one is right: an occurrence exactly on it is
+  // one the window before ended on. The upper one is the pass's own reading of the clock, and an
+  // occurrence landing on it is due now rather than next time, so the bound is nudged past it.
+  const occurrences = cachedRule(expression, tz).between(after, new Date(until.getTime() + 1))
+
+  return occurrences.map(toDate)
+}
+
+/**
+ * An occurrence as the Date the cron pass compares against.
+ *
+ * The nanoseconds a Temporal instant carries have nowhere to go, and nothing is lost: an iCalendar
+ * DTSTART is second-precision, and every occurrence is derived from it.
+ */
+function toDate (occurrence: { epochMilliseconds: number }): Date {
+  return new Date(occurrence.epochMilliseconds)
 }
 
 /**
@@ -315,7 +336,7 @@ export function nextOccurrence (expression: string, after: Date, tz: string): Da
  * evaluated, or would never send anything, is reported to the caller rather than to a warning on
  * every later pass.
  */
-export function assertRrule (expression: string, tz: string): void {
+export function assertRrule (expression: string, tz: string, from = new Date()): void {
   const { ics, rule } = toIcs(expression)
 
   // The expression against a zone known to be usable, so a caller who got both wrong hears about
@@ -329,7 +350,9 @@ export function assertRrule (expression: string, tz: string): void {
 
   // A rule with nothing left to send is the one failure a caller cannot see: the row sits in the
   // table, every pass evaluates it, and no job is ever sent. A spent COUNT and a passed UNTIL both
-  // land here. In the schedule's own zone, since that is the one the pass evaluates.
-  assert(nextOccurrence(expression, new Date(), tz) !== null,
+  // land here. In the schedule's own zone, since that is the one the pass evaluates, and from the
+  // clock the pass reads, so a rule expiring inside the skew window is judged the way it will be
+  // evaluated rather than the way this process happens to see the time.
+  assert(nextOccurrence(expression, from, tz) !== null,
     'rrule expression has no occurrence left, so the schedule would never send a job')
 }
