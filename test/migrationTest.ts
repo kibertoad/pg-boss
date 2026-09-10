@@ -2,10 +2,11 @@ import { expect, beforeEach } from 'vitest'
 import { PgBoss, getConstructionPlans, getMigrationPlans, getRollbackPlans } from '../src/index.ts'
 import { getDb, assertTruthy, getSchemaDefs, itPostgresOnly, start } from './testHelper.ts'
 import Contractor from '../src/contractor.ts'
-import { getAll, migrate, migrateCommands, getMinVersion, next } from '../src/migrationStore.ts'
+import { getAll, getAllForConfig, migrate, migrateCommands, getMinVersion, next } from '../src/migrationStore.ts'
 import packageJson from '../package.json' with { type: 'json' }
 import { setVersion, getPartitionedQueueTables, jobTableFormatFunction, bamCommandIndexName } from '../src/plans.ts'
 import { ctx } from './hooks.ts'
+import type * as types from '../src/types.ts'
 
 const currentSchemaVersion = packageJson.pgboss.schema
 // Version 27 has async migrations that create BAM entries for partitioned tables
@@ -127,6 +128,68 @@ describe('migration', function () {
     }
   })
 
+  // Finds statements that write a column the same migration added above them. CockroachDB runs
+  // ADD COLUMN as a schema-change job, so the transaction that added a column cannot then write it:
+  // the statement fails with 42P10 "column is being backfilled" and takes the whole migration with
+  // it. Both tests below walk the rendered list rather than naming versions, so the next migration
+  // to seed a column is covered without either of them being edited.
+  function sameTransactionBackfills (migration: types.Migration) {
+    const addColumn = /ALTER TABLE\s+custom\.(\w+)\s+ADD COLUMN(?:\s+IF NOT EXISTS)?\s+(\w+)/i
+    const added = new Map<string, Set<string>>()
+    const found: string[] = []
+
+    for (const command of migration.install) {
+      const match = command.match(addColumn)
+
+      if (match) {
+        const [, table, column] = match
+        if (!added.has(table)) added.set(table, new Set())
+        added.get(table)!.add(column.toLowerCase())
+        continue
+      }
+
+      const update = command.match(/UPDATE\s+custom\.(\w+)[\s\S]*?\bSET\b([\s\S]*)/i)
+      if (!update) continue
+
+      const [, table, assignments] = update
+      for (const column of added.get(table) ?? []) {
+        if (new RegExp(`\\b${column}\\s*=`, 'i').test(assignments)) {
+          found.push(command)
+        }
+      }
+    }
+
+    return found
+  }
+
+  it('leaves out every same-transaction backfill when noAddColumnBackfill is set', function () {
+    // A migration that seeds a new column has to leave the seed out under noAddColumnBackfill and
+    // arrange for the runtime to read the same answer without it (v40 falls back to monitor_on; v41
+    // relabels on the first cron pass). Nothing may survive the gate.
+    const offenders = getAll('custom', false, false, true)
+      .flatMap(m => sameTransactionBackfills(m).map(c => `v${m.version}: ${c.trim().split('\n')[0]}`))
+
+    expect(offenders).toEqual([])
+  })
+
+  it('drops only the backfills when noAddColumnBackfill is set, never anything else', function () {
+    // The other half of the gate: a migration must not take unrelated statements out with the
+    // backfill. Anything the flag removes has to be a statement the flag exists to remove, so a
+    // CockroachDB schema ends up differing from a Postgres one by the seed values alone.
+    const standard = getAll('custom')
+    const distributed = getAll('custom', false, false, true)
+
+    expect(distributed.map(m => m.version)).toEqual(standard.map(m => m.version))
+
+    for (const [index, migration] of standard.entries()) {
+      const backfills = new Set(sameTransactionBackfills(migration))
+      const expected = migration.install.filter(c => !backfills.has(c))
+
+      expect(distributed[index].install, `v${migration.version}`).toEqual(expected)
+      expect(distributed[index].uninstall, `v${migration.version}`).toEqual(migration.uninstall)
+    }
+  })
+
   it('getMinVersion returns the lowest previous version in the migration set', function () {
     // The oldest migration is v26 (previous: 25), so no chain exists below 25.
     expect(getMinVersion('custom')).toBe(25)
@@ -152,6 +215,72 @@ describe('migration', function () {
     const plans = getRollbackPlans(schema, currentSchemaVersion)
 
     expect(plans).toBeTruthy()
+  })
+
+  it('shapes every exported plan for the backend it names', function () {
+    // Exported SQL is run by hand, against whatever engine the caller has: the same three functions
+    // the CLI wraps, which takes --backend for exactly this reason. Stock PostgreSQL stays the
+    // default, so a caller that names nothing gets what it always got.
+    const schema = 'custom'
+    const from = currentSchemaVersion - 2
+
+    const stock = {
+      construction: getConstructionPlans(schema),
+      migration: getMigrationPlans(schema, from),
+      rollback: getRollbackPlans(schema, currentSchemaVersion)
+    }
+
+    const distributed = {
+      construction: getConstructionPlans(schema, { backend: 'cockroachdb' }),
+      migration: getMigrationPlans(schema, from, { backend: 'cockroachdb' }),
+      rollback: getRollbackPlans(schema, currentSchemaVersion, { backend: 'cockroachdb' })
+    }
+
+    // The advisory lock wraps all three, so it is the one gate every plan can be checked against.
+    for (const kind of ['construction', 'migration', 'rollback'] as const) {
+      expect(stock[kind], kind).toContain('pg_advisory_xact_lock')
+      expect(distributed[kind], kind).not.toContain('pg_advisory_xact_lock')
+    }
+
+    // The schema choices CockroachDB rejects outright.
+    expect(stock.construction).toMatch(/PARTITION BY/)
+    expect(distributed.construction).not.toMatch(/PARTITION BY|ATTACH PARTITION|INCLUDE \(|DEFERRABLE/)
+
+    // And the seeds noAddColumnBackfill drops, found the same way the gate's own tests find them
+    // rather than by naming a version.
+    const squash = (sql: string) => sql.replace(/\s+/g, ' ')
+    const dropped = getAll(schema).flatMap(sameTransactionBackfills)
+
+    expect(dropped.length).toBeGreaterThan(0)
+
+    for (const statement of dropped) {
+      expect(squash(stock.migration)).toContain(squash(statement))
+      expect(squash(distributed.migration)).not.toContain(squash(statement))
+    }
+  })
+
+  it('keeps the other plan options working alongside a backend', function () {
+    // backend is an addition to these signatures, not a replacement: what each function already
+    // took has to keep working, with or without one.
+    expect(getConstructionPlans('custom', { createSchema: false })).not.toContain('CREATE SCHEMA')
+    expect(getConstructionPlans('custom', { createSchema: false, backend: 'cockroachdb' })).not.toContain('CREATE SCHEMA')
+    expect(getConstructionPlans('custom', { backend: 'cockroachdb' })).toContain('CREATE SCHEMA')
+
+    // A backend nobody has a profile for is rejected where it is named, not carried into the SQL.
+    // @ts-expect-error deliberately naming a backend that is not a profile
+    expect(() => getMigrationPlans('custom', currentSchemaVersion - 1, { backend: 'mysql' })).toThrow(/backend must be one of/)
+  })
+
+  it('exports plans for a backend that keeps some of the postgres schema choices', function () {
+    // Not every distributed engine drops the same things: YugabyteDB runs the standard fetch path
+    // and keeps covering indexes and deferrable constraints, and only loses advisory locks and
+    // table partitioning. A single "distributed" switch here would have taken all four.
+    const yugabyte = getConstructionPlans('custom', { backend: 'yugabytedb' })
+
+    expect(yugabyte).not.toContain('pg_advisory_xact_lock')
+    expect(yugabyte).not.toMatch(/PARTITION BY/)
+    expect(yugabyte).toMatch(/INCLUDE \(/)
+    expect(yugabyte).toMatch(/DEFERRABLE/)
   })
 
   it('should not migrate when current version is not found in migration store', async function () {
@@ -299,7 +428,7 @@ describe('migration', function () {
   it('should roll back an error during a migration', async function () {
     const config = { ...ctx.bossConfig }
 
-    config.migrations = getAll(config.schema)
+    config.migrations = getAllForConfig(config)
 
     // add invalid sql statement to the latest migration
     config.migrations[config.migrations.length - 1].install.push('wat')
@@ -550,7 +679,7 @@ describe('migration', function () {
   // migration list rather than naming versions.
   itPostgresOnly('drops every index a migration created when that migration is rolled back', { timeout: 90000 }, async function () {
     const schema = ctx.bossConfig.schema
-    const migrations = getAll(schema)
+    const migrations = getAllForConfig(ctx.bossConfig)
       .filter(m => m.version > currentSchemaVersion - MIGRATION_DEPTH)
       .sort((a, b) => b.version - a.version)
 
@@ -663,7 +792,7 @@ describe('migration', function () {
     const config = { ...ctx.bossConfig }
 
     // Get all real migrations
-    config.migrations = getAll(config.schema)
+    config.migrations = getAllForConfig(config)
 
     // Create contractor and schema
     const db = await getDb()
@@ -720,7 +849,7 @@ describe('migration', function () {
     const config = { ...ctx.bossConfig }
     const schema = config.schema
 
-    config.migrations = getAll(schema)
+    config.migrations = getAllForConfig(config)
 
     const db = await getDb()
     // @ts-ignore
@@ -768,6 +897,10 @@ describe('migration', function () {
     expect(rolledBackSchema.indexes.rows).not.toEqual(originalSchema.indexes.rows)
   })
 
+  // Version-pinned on purpose, and one of the few that should be. It does not assert a rule every
+  // migration has to follow - a migration that reshapes an index in place has to drop before it
+  // creates - it asserts the ordering of one swap that had to be got right once. It does not grow
+  // with the migration list.
   it('builds a replacement fetch index before retiring the one it replaces, in both directions', function () {
     const forward = getAll('custom').find(m => m.version === 40)
     assertTruthy(forward)
@@ -793,29 +926,6 @@ describe('migration', function () {
     // IF NOT EXISTS, not a drop-and-rebuild: v40 never reshapes job_i5, so one still present is
     // already the v39 shape and must not be rebuilt for nothing.
     expect(uninstall.some(c => /DROP INDEX IF EXISTS .*job_i5/.test(c))).toBe(false)
-  })
-
-  it('leaves the v41 kind backfill out where a column cannot be written in the transaction that added it', function () {
-    const kindBackfill = /UPDATE custom\.schedule SET kind/
-
-    const forward = getAll('custom').find(m => m.version === 41)
-    assertTruthy(forward)
-    expect((forward.install as string[]).some(c => kindBackfill.test(c))).toBe(true)
-
-    // CockroachDB runs ADD COLUMN as a schema-change job and refuses an UPDATE of that column in
-    // the same transaction, which the whole migration is: "column is being backfilled". Only the
-    // backfill goes. The label is left to the first pass that reads the row, and the zone
-    // statements stay, since timezone is not a column this migration added.
-    const distributed = getAll('custom', true, true, true).find(m => m.version === 41)
-    assertTruthy(distributed)
-
-    const install = distributed.install as string[]
-
-    expect(install.some(c => kindBackfill.test(c))).toBe(false)
-    expect(install.some(c => /ADD COLUMN IF NOT EXISTS kind/.test(c))).toBe(true)
-    expect(install.some(c => /UPDATE custom\.schedule SET timezone/.test(c))).toBe(true)
-    expect(install.some(c => /ALTER COLUMN timezone SET DEFAULT/.test(c))).toBe(true)
-    expect(install.some(c => /ADD COLUMN IF NOT EXISTS last_job_id/.test(c))).toBe(true)
   })
 
   itPostgresOnly('labels every schedule stored before v41 from the expression on it', async function () {
@@ -897,7 +1007,7 @@ describe('migration', function () {
     const schema = config.schema
 
     // Get all real migrations
-    config.migrations = getAll(schema)
+    config.migrations = getAllForConfig(config)
 
     // Create contractor and schema
     const db = await getDb()
@@ -952,7 +1062,7 @@ describe('migration', function () {
     const config = { ...ctx.bossConfig }
     const schema = config.schema
 
-    config.migrations = getAll(schema)
+    config.migrations = getAllForConfig(config)
 
     const db = await getDb()
     // @ts-ignore
@@ -1103,7 +1213,7 @@ describe('migration', function () {
     itPostgresOnly('should create job_common i7/i8 via the inlined path without a BAM worker', async function () {
       const config = { ...ctx.bossConfig }
       const dbSchema = config.schema
-      config.migrations = getAll(dbSchema)
+      config.migrations = getAllForConfig(config)
 
       const db = await getDb()
       // @ts-ignore

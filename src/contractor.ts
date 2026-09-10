@@ -2,6 +2,7 @@ import assert from 'node:assert'
 import * as plans from './plans.ts'
 import * as drifter from './drifter.ts'
 import * as migrationStore from './migrationStore.ts'
+import { COMPATIBILITY_FLAGS, getConfig } from './attorney.ts'
 import packageJson from '../package.json' with { type: 'json' }
 import type * as types from './types.ts'
 
@@ -10,20 +11,44 @@ const schemaVersion = packageJson.pgboss.schema as number
 // A name postgres would store unchanged if written without quotes.
 const BARE_LOWER_IDENTIFIER_REGEX = /^[a-z_][a-z0-9_]*$/
 
+// Exported SQL is meant to be run, so it has to be the SQL that backend accepts - and a caller
+// holding a script rather than a connection has nothing else to tell us which engine it is for.
+// Resolved by the same attorney.getConfig() the constructor and the CLI use, so a hand-run
+// migration and a running instance cannot disagree about what an engine supports. Named alone,
+// since a plan needs no connection: getConfig() only reads the profile off it.
+function planConfig (schema: string, backend?: types.BackendProfile): types.ResolvedConstructorOptions {
+  // Left out rather than passed as undefined: resolveBackend reads the key's presence, not its
+  // value, so `{ backend: undefined }` is a named backend that is not one of the profiles.
+  return getConfig(backend ? { schema, backend } : { schema })
+}
+
 class Contractor {
-  static constructionPlans (schema = plans.DEFAULT_SCHEMA, options = { createSchema: true }) {
-    return plans.create(schema, schemaVersion, options)
+  static constructionPlans (schema = plans.DEFAULT_SCHEMA, options: types.ConstructionPlanOptions = {}) {
+    const { createSchema = true, backend } = options
+    const config = planConfig(schema, backend)
+
+    return plans.create(schema, schemaVersion, {
+      createSchema,
+      noTablePartitioning: config.noTablePartitioning,
+      noDeferrableConstraints: config.noDeferrableConstraints,
+      noAdvisoryLocks: config.noAdvisoryLocks,
+      noCoveringIndexes: config.noCoveringIndexes
+    })
   }
 
-  static migrationPlans (schema = plans.DEFAULT_SCHEMA, version = schemaVersion - 1, options: { partitionTables?: types.MigrationPartition[] } = {}) {
+  static migrationPlans (schema = plans.DEFAULT_SCHEMA, version = schemaVersion - 1, options: types.MigrationPlanOptions = {}) {
+    const config = planConfig(schema, options.backend)
+
     // Exported plans run without a BAM worker, so inline the async index builds as direct
     // DDL rather than job_table_run_async() enqueues (see issue #766). Callers that hold a
     // live connection can pass partition metadata to fan the builds out across partitions.
-    return migrationStore.migrate(schema, version, undefined, undefined, { inlineAsync: true, partitionTables: options.partitionTables })
+    return migrationStore.migrate(schema, version, migrationStore.getAllForConfig(config), config.noAdvisoryLocks, { inlineAsync: true, partitionTables: options.partitionTables })
   }
 
-  static rollbackPlans (schema = plans.DEFAULT_SCHEMA, version = schemaVersion) {
-    return migrationStore.rollback(schema, version)
+  static rollbackPlans (schema = plans.DEFAULT_SCHEMA, version = schemaVersion, options: types.PlanOptions = {}) {
+    const config = planConfig(schema, options.backend)
+
+    return migrationStore.rollback(schema, version, migrationStore.getAllForConfig(config), config.noAdvisoryLocks)
   }
 
   private config: types.ResolvedConstructorOptions
@@ -31,9 +56,19 @@ class Contractor {
   private migrations: types.Migration[]
 
   constructor (db: types.IDatabase, config: types.ResolvedConstructorOptions) {
+    // Every statement this class emits is shaped by the compatibility flags, and an unset flag is
+    // read as false - stock PostgreSQL. So a config that never went through attorney.getConfig()
+    // does not fail here, it quietly emits partitioned DDL, advisory locks and covering indexes at a
+    // backend that rejects them, halfway through a migration. Assert instead: the flags are always
+    // booleans once resolved, so their absence is exactly the mistake worth catching.
+    for (const flag of COMPATIBILITY_FLAGS) {
+      assert(typeof config[flag] === 'boolean',
+        `contractor assert: config was not resolved (${flag} is ${typeof config[flag]}). Pass a config from attorney.getConfig().`)
+    }
+
     this.config = config
     this.db = db
-    this.migrations = this.config.migrations || migrationStore.getAll(this.config.schema, this.config.noTablePartitioning, this.config.noCoveringIndexes, this.config.noAddColumnBackfill)
+    this.migrations = this.config.migrations || migrationStore.getAllForConfig(this.config)
   }
 
   async schemaVersion () {
