@@ -430,3 +430,58 @@ describe('transactional work options', function () {
     }).rejects.toThrow(/perJobResults/)
   })
 })
+
+// The two ways a pg-boss-owned transaction fails on a statement of its own rather than the
+// caller's: the BEGIN that opens it, and the COMMIT that settles it. Both have to release the
+// client with the error, so the pool discards a connection whose transaction state it cannot know
+// instead of handing it to the next caller.
+describeTransactional('transaction handle (settle failures)', function () {
+  it('should release the connection when the transaction cannot be opened', async function () {
+    const db = await helper.getDb()
+    const pool = (db as any).pool
+    const released: Array<Error | undefined> = []
+
+    // A client that answers everything except BEGIN, which is how a connection that died while
+    // idle in the pool behaves: the checkout succeeds, and the first statement is what finds out.
+    const client = {
+      query: async (text: string) => {
+        if (text === 'BEGIN') throw new Error('connection is dead')
+        return { rows: [] }
+      },
+      on: () => {},
+      removeListener: () => {},
+      release: (err?: Error) => released.push(err)
+    }
+
+    try {
+      ;(db as any).pool = { connect: async () => client }
+
+      await expect(async () => await db.beginTransaction()).rejects.toThrow('connection is dead')
+
+      expect(released).toHaveLength(1)
+      expect(released[0]).toBeInstanceOf(Error)
+    } finally {
+      ;(db as any).pool = pool
+      await db.close()
+    }
+  })
+
+  // A deferred constraint is the one thing that makes a COMMIT fail after every statement inside
+  // the transaction succeeded. CockroachDB has neither temp tables nor deferrable unique
+  // constraints without an experimental flag, hence postgres only.
+  helper.itPostgresOnly('should reject and settle the handle when the commit fails', async function () {
+    ctx.boss = await helper.start(ctx.bossConfig)
+
+    const db = ctx.boss.getDb()
+    const tx = await db.beginTransaction!()
+
+    await tx.db.executeSql('CREATE TEMP TABLE commit_check (id int UNIQUE DEFERRABLE INITIALLY DEFERRED)')
+    await tx.db.executeSql('INSERT INTO commit_check (id) VALUES (1), (1)')
+
+    await expect(async () => await tx.commit()).rejects.toThrow(/duplicate key/)
+
+    // Released with the error, so the handle is settled and the connection is gone with the
+    // transaction it could not commit.
+    await expect(async () => await tx.db.executeSql('SELECT 1')).rejects.toThrow(/already settled/)
+  })
+})
