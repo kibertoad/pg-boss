@@ -1,6 +1,8 @@
 import { expect } from 'vitest'
 import * as helper from './testHelper.ts'
 import { PgBoss } from '../src/index.ts'
+import type * as types from '../src/types.ts'
+import * as plans from '../src/plans.ts'
 import { delay } from '../src/tools.ts'
 import { ctx } from './hooks.ts'
 
@@ -302,6 +304,95 @@ describeTransactional('transactional work', function () {
     expect(seen).toBe(3)
   })
 
+  it('should roll back a handler abandoned by a shutdown', async function () {
+    ctx.boss = await helper.start(ctx.bossConfig)
+
+    const sideEffects = `${ctx.schema}.side_effect`
+    const db = ctx.boss.getDb()
+
+    await db.executeSql(`CREATE TABLE ${sideEffects} (note text)`)
+
+    const jobId = await ctx.boss.send(ctx.schema, { work: true }, { retryLimit: 0 })
+    helper.assertTruthy(jobId)
+
+    let handlerTx: types.IDatabase | undefined
+    let firstHalfWritten = false
+
+    // Half the handler's work is in the database and the rest never runs, which is what a
+    // non-graceful stop does to any handler it catches mid-flight.
+    await ctx.boss.work(ctx.schema, { transactional: true }, async (jobs, tx) => {
+      handlerTx = tx
+      await tx.executeSql(`INSERT INTO ${sideEffects} (note) VALUES ('first-half')`)
+      firstHalfWritten = true
+      await delay(1000)
+      await tx.executeSql(`INSERT INTO ${sideEffects} (note) VALUES ('second-half')`)
+    })
+
+    await until(async () => firstHalfWritten)
+
+    await ctx.boss.stop({ graceful: false, close: false })
+
+    // The transaction refusing statements is the worker having settled it, which is what the
+    // assertions below are waiting on: an uncommitted insert is invisible from another connection
+    // either way, so an empty table only means anything once the transaction is over.
+    await until(async () => {
+      try {
+        await handlerTx!.executeSql('SELECT 1')
+        return false
+      } catch {
+        return true
+      }
+    })
+
+    const { rows } = await db.executeSql(`SELECT note FROM ${sideEffects}`)
+
+    expect(rows.length).toBe(0)
+
+    const job = await ctx.boss.getJobById(ctx.schema, jobId)
+    helper.assertTruthy(job)
+    expect(job.state).toBe('failed')
+  })
+
+  it('should roll back when the claim is lost while the handler runs', async function () {
+    ctx.boss = await helper.start(ctx.bossConfig)
+
+    const ledger = `${ctx.schema}.ledger`
+    const db = ctx.boss.getDb()
+
+    await db.executeSql(`CREATE TABLE ${ledger} (id serial primary key)`)
+
+    const jobId = await ctx.boss.send(ctx.schema, { work: true }, { retryLimit: 5, retryDelay: 0 })
+    helper.assertTruthy(jobId)
+
+    let attempts = 0
+    let stolen = false
+
+    await ctx.boss.work(ctx.schema, { transactional: true, pollingIntervalSeconds: 0.5 }, async (jobs, tx) => {
+      attempts++
+      await tx.executeSql(`INSERT INTO ${ledger} DEFAULT VALUES`)
+
+      if (!stolen) {
+        stolen = true
+        // On a pooled connection, so it is the job being taken away from this handler rather than
+        // the handler settling it: an operator's fail(), a heartbeat the database stopped seeing,
+        // expireInSeconds, another instance's supervisor. Committing here would leave the ledger
+        // row under a job that is about to run again.
+        await ctx.boss!.fail(ctx.schema, jobs[0].id, new Error('stolen'))
+      }
+    })
+
+    await until(async () => {
+      const job = await ctx.boss!.getJobById(ctx.schema, jobId)
+      return job?.state === 'completed'
+    })
+
+    const { rows } = await db.executeSql(`SELECT id FROM ${ledger}`)
+
+    // One row for two attempts: the stolen one rolled back, the one that kept its claim committed.
+    expect(attempts).toBe(2)
+    expect(rows.length).toBe(1)
+  })
+
   it('should say so when the handler swallows a SQL error and leaves the transaction aborted', async function () {
     ctx.boss = await helper.start(ctx.bossConfig)
 
@@ -338,6 +429,23 @@ describeTransactional('transactional work', function () {
     await ctx.boss.offWork(ctx.schema, { id: workerId })
 
     expect(warnings.some(w => w.data?.type === 'transactional_pool_headroom')).toBe(true)
+  })
+
+  it('should persist the pool headroom warning under persistWarnings', async function () {
+    ctx.boss = await helper.start({ ...ctx.bossConfig, max: 2, persistWarnings: true })
+
+    const workerId = await ctx.boss.work(ctx.schema, { transactional: true, localConcurrency: 2 }, async () => {})
+
+    await ctx.boss.offWork(ctx.schema, { id: workerId })
+
+    const db = await helper.getDb()
+
+    try {
+      const { rows } = await db.executeSql(plans.getWarnings(ctx.schema), [null, 10, 0])
+      expect(rows.some(row => row.type === 'transactional_pool_headroom')).toBe(true)
+    } finally {
+      await db.close()
+    }
   })
 
   it('should reject a transactional worker on a db without transaction support', async function () {

@@ -12,6 +12,7 @@ import { resolveWithinSeconds } from './tools.ts'
 import * as types from './types.ts'
 import Worker from './worker.ts'
 import { JobSpy, type JobSpyInterface } from './spy.ts'
+import { emitAndPersistWarning, type WarningContext } from './warning.ts'
 
 const INTERNAL_QUEUES = Object.values(timekeeper.QUEUES).reduce<Record<string, string | undefined>>((acc, i) => ({ ...acc, [i]: i }), {})
 
@@ -120,6 +121,10 @@ class Manager extends EventEmitter implements types.EventsMixin {
   queues: Record<string, types.QueueResult> | null
   pendingOffWorkCleanups: Set<Promise<any>>
   #spies: Map<string, JobSpy>
+  // Job ids a transactional handler settled itself through the transaction it was handed, keyed on
+  // that transaction's db. #processJobs reads it to interpret its own completion; see the check
+  // there. Weak because the key is the transaction, so an entry goes away with it.
+  #handlerSettledJobs: WeakMap<types.IDatabase, Set<string>>
   #localGroupActive: Map<string, Map<string, number>>
   #localGroupConfig: Map<string, types.GroupConcurrencyConfig>
   #localGroupMaxLimit: Map<string, number>
@@ -134,6 +139,7 @@ class Manager extends EventEmitter implements types.EventsMixin {
     this.queues = {}
     this.pendingOffWorkCleanups = new Set()
     this.#spies = new Map()
+    this.#handlerSettledJobs = new WeakMap()
     this.#localGroupActive = new Map()
     this.#localGroupConfig = new Map()
     this.#localGroupMaxLimit = new Map()
@@ -495,6 +501,7 @@ class Manager extends EventEmitter implements types.EventsMixin {
     // Store AbortController on worker so it can be aborted after graceful shutdown
     if (worker) {
       worker.abortController = ac
+      worker.aborted = false
     }
 
     let heartbeatTimer: ReturnType<typeof setInterval> | null = null
@@ -523,6 +530,7 @@ class Manager extends EventEmitter implements types.EventsMixin {
     try {
       if (transactional) {
         transaction = await this.db.beginTransaction!()
+        this.#handlerSettledJobs.set(transaction.db, new Set())
       }
 
       const handling = transaction
@@ -530,15 +538,36 @@ class Manager extends EventEmitter implements types.EventsMixin {
         : callback(jobs)
 
       const result = await resolveWithinSeconds(handling, maxExpiration, `handler execution exceeded ${maxExpiration}s`, ac)
+
+      // An abort resolves the race rather than rejecting it, so on this line an abandoned handler
+      // looks exactly like one that returned. failWip() aborts after failing the batch, so
+      // committing here would leave whatever the handler had written by then in the database
+      // beside a job that is already failed: the split a transactional worker exists to prevent.
+      // Rolling back instead takes the same path a throw takes, and the fail that follows finds
+      // the jobs already settled and does nothing. The worker's flag rather than the signal,
+      // because resolveWithinSeconds cancels its own timeout through the same controller and so
+      // leaves the signal aborted on every ordinary completion too.
+      if (transaction && worker?.aborted) {
+        throw new Error('pg-boss shut down while the handler was still running')
+      }
+
       if (perJobResults) {
         // #settlePerJob settles each job individually and does its own (synchronous,
         // lookup-free) spy tracking via #trackJobsSettled, so the deferred tracker below
         // is skipped for this path.
         await this.#settlePerJob(name, jobs, result)
       } else {
+        // Read out before the completion below, which goes through the same complete() and would
+        // otherwise record pg-boss's own settle as one the handler made.
+        const settledByHandler = transaction ? this.#takeHandlerSettles(transaction) : null
+
         const completion = await this.complete(name, jobIds, jobIds.length === 1 ? result : undefined, transaction ? { db: transaction.db } : undefined)
         completedResult = result
         completedAffected = completion.affected
+
+        if (settledByHandler) {
+          this.#assertClaimHeld(jobIds, completion.affected, settledByHandler)
+        }
       }
 
       if (transaction) {
@@ -582,6 +611,49 @@ class Manager extends EventEmitter implements types.EventsMixin {
         // perJobResults already tracked inside #settlePerJob; tracking again here would
         // double-record (and overwrite per-job outputs with the batch's slow-path lookup).
         await this.#trackJobsCompleted(name, jobs, completedResult, completedAffected)
+      }
+    }
+  }
+
+  /**
+   * Guards the commit of a transactional batch on the worker still holding the claim it opened the
+   * transaction with.
+   *
+   * `complete()` only settles a job that is still `active`, so a short count means the rows were
+   * taken out of that state while the handler ran. Two things do that. The handler may have settled
+   * the jobs itself through `tx`, which is a documented pattern and leaves pg-boss's own completion
+   * with nothing to update; those ids are recorded as the handler's calls go through, so they cost
+   * no round trip to recognise. Anything left over is a claim that went away: an operator's
+   * `cancel()` or `fail()`, a heartbeat the database stopped seeing, `expireInSeconds`, another
+   * instance's supervisor. That job is going to run again, so committing the handler's writes
+   * beside it produces exactly the duplicate side effect this option exists to prevent. Throwing
+   * rolls them back and takes the ordinary failure path, which records the failure against
+   * whatever state the job is in by then.
+   */
+  #assertClaimHeld (jobIds: string[], affected: number, settledByHandler: Set<string>) {
+    const accounted = affected + jobIds.filter(id => settledByHandler.has(id)).length
+
+    if (accounted < jobIds.length) {
+      throw new Error(`the claim on ${jobIds.length - accounted} of ${jobIds.length} job(s) was lost while the handler ran, so the transaction was rolled back`)
+    }
+  }
+
+  // The ids the handler settled through its transaction. Taken rather than read, so the completion
+  // pg-boss runs next on the same transaction does not add itself to the set.
+  #takeHandlerSettles (transaction: types.TransactionHandle): Set<string> {
+    const settled = this.#handlerSettledJobs.get(transaction.db) ?? new Set<string>()
+    this.#handlerSettledJobs.delete(transaction.db)
+    return settled
+  }
+
+  // Records a settle a transactional handler ran through the transaction it was handed. A no-op for
+  // every other caller: only a transaction #processJobs opened is in the map.
+  #trackHandlerSettle (options: types.ConnectionOptions, ids: string[]) {
+    const settled = options.db && this.#handlerSettledJobs.get(options.db)
+
+    if (settled) {
+      for (const id of ids) {
+        settled.add(id)
       }
     }
   }
@@ -670,7 +742,15 @@ class Manager extends EventEmitter implements types.EventsMixin {
         try {
           await this.fail(worker.name, jobIds, 'pg-boss shut down while active')
         } catch (err: any) {
-          this.emit(events.error, { ...err, message: err.message, stack: err.stack, queue: worker.name, worker: worker.id })
+          try {
+            this.emit(events.error, { ...err, message: err.message, stack: err.stack, queue: worker.name, worker: worker.id })
+          } catch {
+            // An `error` event nobody listens for throws ERR_UNHANDLED_ERROR straight back out of
+            // emit(). Counting listeners here would not see it: the PgBoss instance re-emits this
+            // event, so the throw comes from an application with no `error` handler, one frame
+            // further out than this emitter can measure. Reporting the failure matters less than
+            // reaching the workers after this one, the pool close, and the `stopped` event.
+          }
         }
       }
 
@@ -713,7 +793,7 @@ class Manager extends EventEmitter implements types.EventsMixin {
       assert(typeof this.db.beginTransaction === 'function',
         'transactional workers require a database connection pg-boss can open a transaction on: the built-in pool, or a db adapter implementing beginTransaction')
 
-      this.#warnOnTransactionalPoolHeadroom(localConcurrency)
+      await this.#warnOnTransactionalPoolHeadroom(localConcurrency)
     }
 
     if (localGroupConcurrency != null) {
@@ -813,7 +893,7 @@ class Manager extends EventEmitter implements types.EventsMixin {
   // sized at or below the number of them has nothing left for the fetches, the failures, or
   // maintenance: those wait out connectionTimeoutMillis and then reject. Only measurable for the
   // built-in pool, and a warning rather than an assert, because the ceiling is the operator's call.
-  #warnOnTransactionalPoolHeadroom (localConcurrency: number) {
+  async #warnOnTransactionalPoolHeadroom (localConcurrency: number) {
     if (!this.db._pgbdb) return
 
     const max = this.config.max ?? DEFAULT_POOL_MAX
@@ -822,10 +902,23 @@ class Manager extends EventEmitter implements types.EventsMixin {
 
     if (pinned < max) return
 
-    this.emit(events.warning, {
-      message: `transactional workers can hold ${pinned} of this pool's ${max} connections while their handlers run, leaving nothing for fetches, failures, or maintenance. Raise max above ${pinned}, or lower localConcurrency.`,
-      data: { type: WARNING_TYPES.TRANSACTIONAL_POOL_HEADROOM, max, transactionalWorkers: pinned }
-    })
+    await emitAndPersistWarning(
+      this.#warningContext,
+      WARNING_TYPES.TRANSACTIONAL_POOL_HEADROOM,
+      `transactional workers can hold ${pinned} of this pool's ${max} connections while their handlers run, leaving nothing for fetches, failures, or maintenance. Raise max above ${pinned}, or lower localConcurrency.`,
+      { type: WARNING_TYPES.TRANSACTIONAL_POOL_HEADROOM, max, transactionalWorkers: pinned }
+    )
+  }
+
+  get #warningContext (): WarningContext {
+    return {
+      emitter: this,
+      db: this.db,
+      schema: this.config.schema,
+      persistWarnings: this.config.persistWarnings,
+      warningEvent: events.warning,
+      errorEvent: events.error
+    }
   }
 
   private addWorker (worker: Worker<any>) {
@@ -1568,6 +1661,8 @@ class Manager extends EventEmitter implements types.EventsMixin {
     const { table } = await this.getQueueCache(name)
     const outputData = this.mapCompletionDataArg(data)
 
+    this.#trackHandlerSettle(options, ids)
+
     // noMultiMutationCte: split the dependency-unblocking into a separate statement to
     // avoid CockroachDB's multi-mutation CTE limitation (completeJobs updates two tables).
     if (this.config.noMultiMutationCte) {
@@ -1605,6 +1700,8 @@ class Manager extends EventEmitter implements types.EventsMixin {
     const ids = this.mapCompletionIdArg(id, 'fail')
     const { table } = await this.getQueueCache(name)
     const outputData = this.mapCompletionDataArg(data)
+
+    this.#trackHandlerSettle(options, ids)
 
     // noMultiMutationCte: use separate queries to avoid CockroachDB's multi-mutation CTE limitation.
     // The delete and re-insert run in a single transaction (see ensureTransaction) so the
@@ -1789,6 +1886,9 @@ class Manager extends EventEmitter implements types.EventsMixin {
     const db = this.assertDb(options)
     const ids = this.mapCompletionIdArg(id, 'deleteJob')
     const { table } = await this.getQueueCache(name)
+
+    this.#trackHandlerSettle(options, ids)
+
     const sql = plans.deleteJobsById(this.config.schema, table)
     const result = await db.executeSql(sql, [name, ids])
     return this.mapCommandResponse(ids, result)
@@ -1821,6 +1921,9 @@ class Manager extends EventEmitter implements types.EventsMixin {
     const db = this.assertDb(options)
     const ids = this.mapCompletionIdArg(id, 'cancel')
     const { table } = await this.getQueueCache(name)
+
+    this.#trackHandlerSettle(options, ids)
+
     const sql = plans.cancelJobs(this.config.schema, table)
     const result = await db.executeSql(sql, [name, ids])
     return this.mapCommandResponse(ids, result)

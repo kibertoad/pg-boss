@@ -72,6 +72,8 @@ The default options for `work()` is 1 job every 2 seconds.
 
   The job is claimed before the transaction opens, so it is `active` for as long as the handler runs and behaves like any other job while it is: `expireInSeconds` bounds it, heartbeats refresh it, and a crashed process leaves it to be reclaimed by the timeout rather than lost. The option changes what the handler can commit atomically, and nothing about how jobs are fetched, batched, retried, or supervised.
 
+  A commit needs the claim the handler started with. If something takes the job away while the handler runs, whether that is `expireInSeconds`, a heartbeat the database stopped seeing, an operator's `cancel()` or `fail()`, or another instance's supervisor, the transaction rolls back instead of committing under a job that is about to run again. A shutdown that abandons a handler mid-flight is the same: whatever it had written by then is rolled back, and the job carries the shutdown failure. Settling the jobs from inside the handler through `tx` is not affected, since that settlement is part of the transaction being committed.
+
   **Requirements and limits**
 
   - Needs a database connection pg-boss can open a transaction on: the built-in pool, or a `db` adapter implementing `beginTransaction`. Passing `transactional: true` without one throws from `work()`.
