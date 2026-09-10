@@ -28,7 +28,7 @@ export interface IDatabase {
   listen?(channel: string, onNotification: (payload: string) => void, onReconnect: () => void): Promise<ListenHandle>;
   /**
    * Optional capability for pg-boss-owned transactions. When present, pg-boss can open a
-   * transaction whose begin and settle happen in different call frames, which is what
+   * transaction and settle it from a different call frame, which is what
    * `work(name, { transactional: true }, ...)` needs. The built-in pool-based Db implements it;
    * a custom adapter may implement it to enable transactional workers.
    */
@@ -42,9 +42,16 @@ export interface ListenHandle {
 export interface TransactionHandle {
   /** Runs statements inside the transaction. Pass it as the `db` option on any pg-boss call. */
   db: IDatabase;
-  /** Commits and releases the underlying connection. */
+  /**
+   * Commits and releases the underlying connection. Rejects if the commit fails, or if the
+   * transaction has already been settled.
+   */
   commit(): Promise<void>;
-  /** Rolls back and releases the underlying connection. Never rejects. */
+  /**
+   * Rolls back and releases the underlying connection. Never rejects, and safe to call more than
+   * once. Implementations must not wait indefinitely: a rollback that cannot get through has to
+   * drop the connection instead, so the caller's error path always makes progress.
+   */
   rollback(): Promise<void>;
 }
 
@@ -927,19 +934,25 @@ export type WorkOptions = JobFetchOptions & JobPollingOptions & WorkConcurrencyO
    */
   perJobResults?: boolean;
   /**
-   * Run the fetch, the handler, and the completion inside one database transaction.
+   * Run the handler and the job's completion inside one database transaction.
    *
    * The handler receives a second argument, a `db` for that transaction. Anything written through
    * it commits atomically with the job's completion, so a handler cannot leave its side effects
-   * committed and the job unfinished, or the reverse. Throwing rolls the whole unit back, and the
-   * job is then failed on a separate connection so retry accounting still applies.
+   * committed and the job unfinished, or the reverse. Throwing rolls back the handler's writes and
+   * the completion, and the job is then failed on a pooled connection, so retry counts, retry
+   * delays, and dead lettering work exactly as they do without this option.
+   *
+   * The job is claimed before the transaction opens, so it stays `active` for as long as the
+   * handler runs and every supervision path (`expireInSeconds`, heartbeats, another instance's
+   * monitor) sees it.
    *
    * Requires a database connection pg-boss can open a transaction on: the built-in pool, or a `db`
-   * adapter implementing `beginTransaction`. Cannot be combined with `perJobResults`,
-   * `groupConcurrency`, or `localGroupConcurrency`.
+   * adapter implementing `beginTransaction`. Cannot be combined with `perJobResults`, which
+   * settles each job in a batch separately while one transaction has a single outcome.
    *
-   * The transaction is open for as long as the handler runs, so this suits short handlers.
-   * Heartbeats are not sent, since the `active` row is not visible outside the transaction.
+   * Each handler in flight holds a connection for its own duration, so the pool needs room for
+   * `localConcurrency` connections on top of what the rest of pg-boss uses. Long transactions also
+   * hold back vacuum, so this suits handlers that finish in seconds.
    * @default false
    */
   transactional?: boolean;
@@ -989,9 +1002,9 @@ export interface PerJobWorkWithMetadataHandler<ReqData> {
 }
 
 /**
- * Handler for a `transactional: true` worker. `tx` runs statements inside the transaction the jobs
- * were fetched in, so pass it as the `db` option on any pg-boss call, or hand it to your own SQL,
- * to have that work commit with the job's completion.
+ * Handler for a `transactional: true` worker. `tx` runs statements inside the transaction pg-boss
+ * commits the batch in, so pass it as the `db` option on any pg-boss call, or hand it to your own
+ * SQL, to have that work commit with the job's completion.
  */
 export interface TransactionalWorkHandler<ReqData, ResData = any> {
   (jobs: Job<ReqData>[], tx: IDatabase): Promise<ResData>;

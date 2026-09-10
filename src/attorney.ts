@@ -456,20 +456,16 @@ function checkWorkArgs (name: string, args: any[]): {
   return { options, callback }
 }
 
-// Rejects the combinations a transactional worker cannot honour, rather than quietly degrading one
-// of the two features.
+// Rejects the one combination a transactional worker cannot honour, rather than quietly degrading
+// one of the two features. Everything else about a worker (fetching, batching, concurrency, group
+// limits, heartbeats) is untouched by the option, because the transaction covers only the handler
+// and the completion.
 function validateTransactionalConfig (options: any) {
   if (!options.transactional) return
 
   // Per-job settlement partitions a batch into separate outcomes; one transaction can only commit
   // or roll back as a whole, so the two contradict each other.
   assert(!options.perJobResults, 'transactional cannot be combined with perJobResults')
-
-  // groupConcurrency counts active jobs across instances, and localGroupConcurrency restores the
-  // jobs it holds back. Neither survives a fetch that is not committed yet: another instance cannot
-  // see the active rows, and restore() on the pooled connection cannot see the jobs to restore.
-  assert(options.groupConcurrency == null, 'transactional cannot be combined with groupConcurrency')
-  assert(options.localGroupConcurrency == null, 'transactional cannot be combined with localGroupConcurrency')
 }
 
 function checkFetchArgs (name: string, options: any) {

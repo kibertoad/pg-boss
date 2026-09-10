@@ -73,6 +73,29 @@ describeTransactional('transactional work', function () {
     expect(rows.length).toBe(0)
   })
 
+  it('should leave the job active and readable outside the transaction while the handler runs', async function () {
+    ctx.boss = await helper.start(ctx.bossConfig)
+
+    const jobId = await ctx.boss.send(ctx.schema, { work: true })
+    helper.assertTruthy(jobId)
+
+    let stateDuringHandler: string | undefined
+
+    // The claim is committed before the transaction opens, which is what leaves every supervision
+    // path (timeouts, heartbeats, another instance's monitor) able to see the job it is holding.
+    await ctx.boss.work(ctx.schema, { transactional: true }, async () => {
+      const job = await ctx.boss!.getJobById(ctx.schema, jobId)
+      stateDuringHandler = job?.state
+    })
+
+    await until(async () => {
+      const job = await ctx.boss!.getJobById(ctx.schema, jobId)
+      return job?.state === 'completed'
+    })
+
+    expect(stateDuringHandler).toBe('active')
+  })
+
   it('should still apply retry accounting after a rollback', async function () {
     ctx.boss = await helper.start(ctx.bossConfig)
 
@@ -91,8 +114,8 @@ describeTransactional('transactional work', function () {
       return job?.state === 'failed'
     })
 
-    // the rollback un-fetches the job, so the retry has to come from fail(), not from the job
-    // simply reappearing in created
+    // one retry, then terminal: the rollback takes the handler's writes and nothing else, so the
+    // attempt the fetch recorded still counts
     expect(attempts).toBe(2)
 
     const job = await ctx.boss.getJobById(ctx.schema, jobId)
@@ -120,6 +143,117 @@ describeTransactional('transactional work', function () {
     await until(async () => {
       const [job] = await ctx.boss!.fetch(deadLetter)
       return !!job
+    })
+  })
+
+  it('should let the supervisor reclaim a transactional job whose handler never returns', async function () {
+    ctx.boss = await helper.start({ ...ctx.bossConfig, noDefault: true })
+
+    await ctx.boss.createQueue(ctx.schema, { retryLimit: 0 })
+
+    const jobId = await ctx.boss.send(ctx.schema, { work: true })
+    helper.assertTruthy(jobId)
+
+    let releaseHandler = () => {}
+    let handlerStarted = false
+
+    await ctx.boss.work(ctx.schema, { transactional: true }, async () => {
+      handlerStarted = true
+      await new Promise<void>(resolve => { releaseHandler = resolve })
+    })
+
+    await until(async () => handlerStarted)
+
+    // Backdate the claim past its expiration, the way a process that died holding the transaction
+    // would look to the next supervise pass.
+    const db = await helper.getDb()
+
+    try {
+      await db.executeSql(`UPDATE ${ctx.schema}.job SET started_on = now() - interval '1 hour' WHERE id = $1`, [jobId])
+    } finally {
+      await db.close()
+    }
+
+    await ctx.boss.supervise(ctx.schema)
+
+    const job = await ctx.boss.getJobById(ctx.schema, jobId)
+    helper.assertTruthy(job)
+    expect(job.state).toBe('failed')
+    expect(job.output).toEqual({ value: { message: 'job timed out' } })
+
+    releaseHandler()
+  })
+
+  it('should refresh the heartbeat while a transactional handler runs', async function () {
+    ctx.boss = await helper.start({ ...ctx.bossConfig, noDefault: true })
+
+    await ctx.boss.createQueue(ctx.schema, { heartbeatSeconds: 10 })
+
+    const jobId = await ctx.boss.send(ctx.schema, { work: true })
+    helper.assertTruthy(jobId)
+
+    const db = await helper.getDb()
+
+    const readHeartbeat = async () => {
+      const { rows } = await db.executeSql(`SELECT heartbeat_on FROM ${ctx.schema}.job WHERE id = $1`, [jobId])
+      return rows[0].heartbeat_on.getTime() as number
+    }
+
+    let refreshed = false
+
+    // The heartbeat runs on a pooled connection against the claimed row, so it reaches the job a
+    // transactional handler is holding just as it does any other.
+    await ctx.boss.work(ctx.schema, { transactional: true, heartbeatRefreshSeconds: 0.5 }, async () => {
+      const before = await readHeartbeat()
+      await until(async () => (await readHeartbeat()) > before)
+      refreshed = true
+    })
+
+    await until(async () => {
+      const job = await ctx.boss!.getJobById(ctx.schema, jobId)
+      return job?.state === 'completed'
+    })
+
+    await db.close()
+
+    expect(refreshed).toBe(true)
+  })
+
+  it('should work with localGroupConcurrency', async function () {
+    ctx.boss = await helper.start(ctx.bossConfig)
+
+    const ids: string[] = []
+
+    for (let i = 0; i < 2; i++) {
+      const id: string | null = await ctx.boss.send(ctx.schema, { seq: i }, { group: { id: 'tx-group' } })
+      helper.assertTruthy(id)
+      ids.push(id)
+    }
+
+    await ctx.boss.work(ctx.schema, { transactional: true, localGroupConcurrency: 1, pollingIntervalSeconds: 0.5 }, async () => {})
+
+    await until(async () => {
+      const jobs = await Promise.all(ids.map(id => ctx.boss!.getJobById(ctx.schema, id)))
+      return jobs.every(job => job?.state === 'completed')
+    })
+  })
+
+  it('should work with groupConcurrency', async function () {
+    ctx.boss = await helper.start(ctx.bossConfig)
+
+    const ids: string[] = []
+
+    for (let i = 0; i < 2; i++) {
+      const id: string | null = await ctx.boss.send(ctx.schema, { seq: i }, { group: { id: 'tx-group' } })
+      helper.assertTruthy(id)
+      ids.push(id)
+    }
+
+    await ctx.boss.work(ctx.schema, { transactional: true, groupConcurrency: 1, pollingIntervalSeconds: 0.5 }, async () => {})
+
+    await until(async () => {
+      const jobs = await Promise.all(ids.map(id => ctx.boss!.getJobById(ctx.schema, id)))
+      return jobs.every(job => job?.state === 'completed')
     })
   })
 
@@ -168,28 +302,42 @@ describeTransactional('transactional work', function () {
     expect(seen).toBe(3)
   })
 
-  it('should return a job to the queue when the transaction never commits', async function () {
+  it('should say so when the handler swallows a SQL error and leaves the transaction aborted', async function () {
     ctx.boss = await helper.start(ctx.bossConfig)
 
-    const jobId = await ctx.boss.send(ctx.schema, { work: true }, { retryLimit: 5 })
+    const jobId = await ctx.boss.send(ctx.schema, { work: true }, { retryLimit: 0 })
     helper.assertTruthy(jobId)
 
-    const workerId = await ctx.boss.work(ctx.schema, { transactional: true }, async () => {
-      throw new Error('handler exploded')
+    await ctx.boss.work(ctx.schema, { transactional: true }, async (jobs, tx) => {
+      try {
+        await tx.executeSql('SELECT 1 FROM a_table_that_does_not_exist')
+      } catch {
+        // swallowed on purpose: the transaction stays aborted, so pg-boss's own completion is the
+        // statement that trips over it
+      }
     })
 
     await until(async () => {
       const job = await ctx.boss!.getJobById(ctx.schema, jobId)
-      return job?.retryCount === 1
+      return job?.state === 'failed'
     })
+
+    const job = await ctx.boss.getJobById(ctx.schema, jobId)
+    helper.assertTruthy(job)
+    expect(JSON.stringify(job.output)).toContain('left its transaction aborted')
+  })
+
+  it('should warn when transactional workers leave the pool no headroom', async function () {
+    ctx.boss = await helper.start({ ...ctx.bossConfig, max: 2 })
+
+    const warnings: any[] = []
+    ctx.boss.on('warning', warning => warnings.push(warning))
+
+    const workerId = await ctx.boss.work(ctx.schema, { transactional: true, localConcurrency: 2 }, async () => {})
 
     await ctx.boss.offWork(ctx.schema, { id: workerId })
 
-    // no orphaned active row: the rollback returned the job to the queue rather than leaving it
-    // active until expireInSeconds elapsed
-    const job = await ctx.boss.getJobById(ctx.schema, jobId)
-    helper.assertTruthy(job)
-    expect(job.state).not.toBe('active')
+    expect(warnings.some(w => w.data?.type === 'transactional_pool_headroom')).toBe(true)
   })
 
   it('should reject a transactional worker on a db without transaction support', async function () {
@@ -213,6 +361,56 @@ describeTransactional('transactional work', function () {
   })
 })
 
+describeTransactional('transaction handle', function () {
+  it('should settle once and refuse anything after', async function () {
+    ctx.boss = await helper.start(ctx.bossConfig)
+
+    const db = ctx.boss.getDb()
+    const tx = await db.beginTransaction!()
+
+    await tx.db.executeSql('SELECT 1')
+    await tx.rollback()
+
+    // idempotent: a second rollback must not send ROLLBACK down a connection the pool has since
+    // handed to someone else
+    await tx.rollback()
+
+    await expect(async () => await tx.db.executeSql('SELECT 1')).rejects.toThrow(/already settled/)
+    await expect(async () => await tx.commit()).rejects.toThrow(/already settled/)
+  })
+})
+
+helper.describeMultiConnectionOnly('transaction handle (connection loss)', function () {
+  it('should survive a connection dropped mid-transaction', async function () {
+    ctx.boss = await helper.start(ctx.bossConfig)
+
+    const db = ctx.boss.getDb()
+    const tx = await db.beginTransaction!()
+
+    const { rows } = await tx.db.executeSql('SELECT pg_backend_pid() AS pid')
+    const other = await helper.getDb()
+
+    try {
+      await other.executeSql('SELECT pg_terminate_backend($1)', [rows[0].pid])
+    } finally {
+      await other.close()
+    }
+
+    // pg-pool takes its own 'error' listener off a checked-out client, so without one of its own
+    // the handle would let this drop end the process instead of failing the transaction.
+    await until(async () => {
+      try {
+        await tx.db.executeSql('SELECT 1')
+        return false
+      } catch {
+        return true
+      }
+    })
+
+    await tx.rollback()
+  })
+})
+
 // Option validation needs no database transaction support, so it runs on every backend.
 describe('transactional work options', function () {
   it('should reject a non-boolean transactional option', async function () {
@@ -230,21 +428,5 @@ describe('transactional work options', function () {
     await expect(async () => {
       await ctx.boss!.work(ctx.schema, { transactional: true, perJobResults: true }, async () => [])
     }).rejects.toThrow(/perJobResults/)
-  })
-
-  it('should reject transactional combined with groupConcurrency', async function () {
-    ctx.boss = await helper.start(ctx.bossConfig)
-
-    await expect(async () => {
-      await ctx.boss!.work(ctx.schema, { transactional: true, groupConcurrency: 2 }, async () => {})
-    }).rejects.toThrow(/groupConcurrency/)
-  })
-
-  it('should reject transactional combined with localGroupConcurrency', async function () {
-    ctx.boss = await helper.start(ctx.bossConfig)
-
-    await expect(async () => {
-      await ctx.boss!.work(ctx.schema, { transactional: true, localGroupConcurrency: 2 }, async () => {})
-    }).rejects.toThrow(/localGroupConcurrency/)
   })
 })

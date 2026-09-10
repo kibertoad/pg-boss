@@ -15,6 +15,17 @@ import { JobSpy, type JobSpyInterface } from './spy.ts'
 
 const INTERNAL_QUEUES = Object.values(timekeeper.QUEUES).reduce<Record<string, string | undefined>>((acc, i) => ({ ...acc, [i]: i }), {})
 
+// postgres: current transaction is aborted, commands ignored until end of transaction block
+const TRANSACTION_ABORTED = '25P02'
+
+// pg's own default when the pool size is not configured. Used to tell a transactional worker how
+// much room it actually has, since each handler in flight holds a connection of its own.
+const DEFAULT_POOL_MAX = 10
+
+const WARNING_TYPES = {
+  TRANSACTIONAL_POOL_HEADROOM: 'transactional_pool_headroom'
+} as const
+
 // CockroachDB returns integer columns (INT8) as strings; these aliased metadata
 // fields must be coerced back to numbers when backend === 'cockroachdb'.
 const NUMERIC_METADATA_FIELDS = [
@@ -68,6 +79,7 @@ const QUEUE_STATS_FORCE_TTL_SECONDS = 60
 
 const events = {
   error: 'error',
+  warning: 'warning',
   wip: 'wip'
 }
 
@@ -449,13 +461,25 @@ class Manager extends EventEmitter implements types.EventsMixin {
     }
   }
 
+  /**
+   * Runs a batch through its handler and settles it.
+   *
+   * With `transactional`, the handler and the completion run in one transaction of their own. The
+   * batch is already claimed by the time this is called, so the transaction covers the handler's
+   * writes and the completion and nothing else: success commits them together, and a throw rolls
+   * both back and then fails the jobs on a pooled connection, where the retry accounting is the
+   * same as any other worker's. Because the claim is outside the transaction, the jobs stay
+   * visibly `active` throughout, which is what keeps heartbeats, `expireInSeconds`, and another
+   * instance's supervisor working on them as usual.
+   */
   async #processJobs<T> (
     name: string,
     jobs: types.Job<T>[],
     callback: types.WorkHandler<T>,
     worker?: Worker<T>,
     heartbeatRefreshSeconds?: number,
-    perJobResults = false
+    perJobResults = false,
+    transactional = false
   ): Promise<void> {
     const jobIds = jobs.map(job => job.id)
     const maxExpiration = jobs.reduce((acc, i) => Math.max(acc, i.expireInSeconds), 0)
@@ -491,20 +515,50 @@ class Manager extends EventEmitter implements types.EventsMixin {
     let completedAffected = 0
     let failedError: any
     let didFail = false
+    // Only for a transactional worker, and only from the begin below until it settles. rollback()
+    // is idempotent, so the catch can settle it without tracking whether the commit got there
+    // first.
+    let transaction: types.TransactionHandle | null = null
 
     try {
-      const result = await resolveWithinSeconds(callback(jobs), maxExpiration, `handler execution exceeded ${maxExpiration}s`, ac)
+      if (transactional) {
+        transaction = await this.db.beginTransaction!()
+      }
+
+      const handling = transaction
+        ? (callback as unknown as types.TransactionalWorkHandler<T>)(jobs, transaction.db)
+        : callback(jobs)
+
+      const result = await resolveWithinSeconds(handling, maxExpiration, `handler execution exceeded ${maxExpiration}s`, ac)
       if (perJobResults) {
         // #settlePerJob settles each job individually and does its own (synchronous,
         // lookup-free) spy tracking via #trackJobsSettled, so the deferred tracker below
         // is skipped for this path.
         await this.#settlePerJob(name, jobs, result)
       } else {
-        const completion = await this.complete(name, jobIds, jobIds.length === 1 ? result : undefined)
+        const completion = await this.complete(name, jobIds, jobIds.length === 1 ? result : undefined, transaction ? { db: transaction.db } : undefined)
         completedResult = result
         completedAffected = completion.affected
       }
+
+      if (transaction) {
+        await transaction.commit()
+      }
     } catch (err: any) {
+      if (transaction) {
+        // Before the fail, not after: fail() runs on a pooled connection and would otherwise wait
+        // on the job rows this transaction still holds locked.
+        await transaction.rollback()
+
+        // A handler that catches a SQL error it raised through the transaction leaves that
+        // transaction aborted, and postgres then rejects every later statement in it with 25P02,
+        // including the completion pg-boss runs there. Name the cause, since the raw message
+        // arrives with nothing to connect it to the handler.
+        if (err?.code === TRANSACTION_ABORTED) {
+          err.message = `${err.message} (the handler left its transaction aborted: let a SQL error raised through tx propagate out of the handler, or isolate the statement with a SAVEPOINT)`
+        }
+      }
+
       await this.fail(name, jobIds, err)
       failedError = err
       didFail = true
@@ -602,12 +656,24 @@ class Manager extends EventEmitter implements types.EventsMixin {
     this.#localGroupMaxLimit.clear()
   }
 
+  // Last step of a shutdown: closing the pool, marking the instance stopped, and emitting
+  // `stopped` all wait on this, so every worker has to be reached even when one of them cannot be
+  // failed.
   async failWip () {
     for (const worker of this.workers.values()) {
       const jobIds = worker.jobs.map(j => j.id)
+
       if (jobIds.length) {
-        await this.fail(worker.name, jobIds, 'pg-boss shut down while active')
+        // The fail goes in before the abort, so it lands while the handler is still holding the
+        // jobs active and its completion finds nothing to settle. Its own failure is reported
+        // rather than thrown: the remaining workers still have to be aborted.
+        try {
+          await this.fail(worker.name, jobIds, 'pg-boss shut down while active')
+        } catch (err: any) {
+          this.emit(events.error, { ...err, message: err.message, stack: err.stack, queue: worker.name, worker: worker.id })
+        }
       }
+
       worker.abort()
     }
   }
@@ -646,6 +712,8 @@ class Manager extends EventEmitter implements types.EventsMixin {
     if (transactional) {
       assert(typeof this.db.beginTransaction === 'function',
         'transactional workers require a database connection pg-boss can open a transaction on: the built-in pool, or a db adapter implementing beginTransaction')
+
+      this.#warnOnTransactionalPoolHeadroom(localConcurrency)
     }
 
     if (localGroupConcurrency != null) {
@@ -682,70 +750,44 @@ class Manager extends EventEmitter implements types.EventsMixin {
     }
 
     const createWorker = (workerId: string, workId: string) => {
-      // The transaction a transactional worker opened in fetch() and has not settled yet. Worker
-      // calls fetch() and onFetch() back to back in one try block, so the handle only ever lives
-      // across that gap; onFetch takes ownership on its first line and settles it either way.
-      let openTransaction: types.TransactionHandle | null = null
-
-      const fetch = async () => {
-        if (!transactional) {
-          const ignoreGroups = localGroupConcurrency != null
-            ? this.#getGroupsAtLocalCapacity(name)
-            : undefined
-          return await this.fetch<ReqData>(name, { batchSize, includeMetadata, priority, orderByCreatedOn, groupConcurrency, ignoreGroups, minPriority, maxPriority })
-        }
-
-        const handle = await this.db.beginTransaction!()
-
-        try {
-          const jobs = await this.fetch<ReqData>(name, { batchSize, includeMetadata, priority, orderByCreatedOn, minPriority, maxPriority, db: handle.db })
-
-          // Nothing to do, so nothing to keep a connection pinned for. Far and away the common
-          // case on an idle queue, and holding the transaction until the next poll would keep one
-          // pool client per worker permanently checked out.
-          if (!jobs.length) {
-            await handle.rollback()
-            return jobs
-          }
-
-          openTransaction = handle
-          return jobs
-        } catch (err) {
-          await handle.rollback()
-          throw err
-        }
+      const fetch = () => {
+        const ignoreGroups = localGroupConcurrency != null
+          ? this.#getGroupsAtLocalCapacity(name)
+          : undefined
+        return this.fetch<ReqData>(name, { batchSize, includeMetadata, priority, orderByCreatedOn, groupConcurrency, ignoreGroups, minPriority, maxPriority })
       }
 
       const onFetch = async (jobs: types.Job<ReqData>[]) => {
-        const handle = openTransaction
-        openTransaction = null
-
         if (!jobs.length) return
+        if (this.config.__test__throw_worker) throw new Error('__test__throw_worker')
 
-        try {
-          if (this.config.__test__throw_worker) throw new Error('__test__throw_worker')
+        this.emitWip(name)
+        this.#trackJobsActive(name, jobs)
 
-          this.emitWip(name)
-          this.#trackJobsActive(name, jobs)
+        // Get the worker instance for abort controller tracking
+        const worker = this.workers.get(workerId)
 
-          // Get the worker instance for abort controller tracking
-          const worker = this.workers.get(workerId)
+        // Skip all in-memory group tracking when localGroupConcurrency is not enabled
+        if (localGroupConcurrency == null) {
+          await this.#processJobs(name, jobs, callback, worker, heartbeatRefreshSeconds, perJobResults, transactional)
+        } else {
+          const { allowed, excess, groupedJobs } = this.#trackLocalGroupStart(name, jobs)
 
-          if (handle) {
-            await this.#processJobsTransactional(name, jobs, callback, handle, worker)
-            this.emitWip(name)
-            return
+          try {
+            if (excess.length > 0) {
+              const excessIds = excess.map(job => job.id)
+              await this.restore(name, excessIds)
+            }
+
+            if (allowed.length > 0) {
+              await this.#processJobs(name, allowed, callback, worker, heartbeatRefreshSeconds, perJobResults, transactional)
+            }
+          } finally {
+            this.#trackLocalGroupEnd(name, groupedJobs)
           }
-
-          await this.#onFetchStandard(name, jobs, callback, worker, heartbeatRefreshSeconds, perJobResults, localGroupConcurrency)
-
-          this.emitWip(name)
-        } catch (err) {
-          // #processJobsTransactional always settles the handle itself, so this only fires for a
-          // throw before it was reached (the test hook, or a spy bookkeeping failure).
-          if (handle) await handle.rollback()
-          throw err
         }
+
+        this.emitWip(name)
       }
 
       const onError = (error: any) => {
@@ -767,127 +809,23 @@ class Manager extends EventEmitter implements types.EventsMixin {
     return firstWorkerId
   }
 
-  // The non-transactional half of a worker's onFetch, unchanged from when it was inline: process
-  // the batch, applying in-memory group tracking only when localGroupConcurrency is enabled.
-  async #onFetchStandard<T> (
-    name: string,
-    jobs: types.Job<T>[],
-    callback: types.WorkHandler<T>,
-    worker: Worker<T> | undefined,
-    heartbeatRefreshSeconds: number | undefined,
-    perJobResults: boolean,
-    localGroupConcurrency: number | types.GroupConcurrencyConfig | undefined
-  ): Promise<void> {
-    if (localGroupConcurrency == null) {
-      await this.#processJobs(name, jobs, callback, worker, heartbeatRefreshSeconds, perJobResults)
-      return
-    }
+  // Each transactional handler in flight holds a pool connection for its own duration, so a pool
+  // sized at or below the number of them has nothing left for the fetches, the failures, or
+  // maintenance: those wait out connectionTimeoutMillis and then reject. Only measurable for the
+  // built-in pool, and a warning rather than an assert, because the ceiling is the operator's call.
+  #warnOnTransactionalPoolHeadroom (localConcurrency: number) {
+    if (!this.db._pgbdb) return
 
-    const { allowed, excess, groupedJobs } = this.#trackLocalGroupStart(name, jobs)
+    const max = this.config.max ?? DEFAULT_POOL_MAX
+    const running = [...this.workers.values()].filter(worker => worker.options.transactional).length
+    const pinned = running + localConcurrency
 
-    try {
-      if (excess.length > 0) {
-        const excessIds = excess.map(job => job.id)
-        await this.restore(name, excessIds)
-      }
+    if (pinned < max) return
 
-      if (allowed.length > 0) {
-        await this.#processJobs(name, allowed, callback, worker, heartbeatRefreshSeconds, perJobResults)
-      }
-    } finally {
-      this.#trackLocalGroupEnd(name, groupedJobs)
-    }
-  }
-
-  /**
-   * Runs a batch inside the transaction it was fetched in, then settles that transaction.
-   *
-   * Success commits the fetch, everything the handler wrote through `tx`, and the completion as one
-   * unit, so a handler cannot leave its side effects committed and the job unfinished, or a job
-   * completed with its side effects lost.
-   *
-   * Failure rolls all of it back, which also un-fetches the jobs, so the attempt is replayed and
-   * `fail()` then runs on the pooled connection to apply retry accounting. `failJobsById` matches
-   * every state below `completed`, so a job that rolled back to `created` still fails, retries,
-   * and dead-letters exactly as it would have from `active`.
-   *
-   * Deliberately no heartbeat timer: the `active` row is invisible outside this transaction, so
-   * nothing could read a refreshed `heartbeat_on` and the supervisor could not fail the job on a
-   * stale one either. `resolveWithinSeconds` still bounds the handler in process, and a crashed
-   * process aborts the transaction, which returns the jobs to the queue immediately rather than
-   * after `expireInSeconds`.
-   */
-  async #processJobsTransactional<T> (
-    name: string,
-    jobs: types.Job<T>[],
-    callback: types.WorkHandler<T>,
-    handle: types.TransactionHandle,
-    worker?: Worker<T>
-  ): Promise<void> {
-    const jobIds = jobs.map(job => job.id)
-    const maxExpiration = jobs.reduce((acc, i) => Math.max(acc, i.expireInSeconds), 0)
-    const ac = new AbortController()
-    jobs.forEach(job => { job.signal = ac.signal })
-
-    if (worker) {
-      worker.abortController = ac
-    }
-
-    let completedResult: unknown
-    let completedAffected = 0
-    let failedError: any
-    let didFail = false
-    let settled = false
-
-    try {
-      const transactionalCallback = callback as unknown as types.TransactionalWorkHandler<T>
-      const result = await resolveWithinSeconds(transactionalCallback(jobs, handle.db), maxExpiration, `handler execution exceeded ${maxExpiration}s`, ac)
-      const completion = await this.complete(name, jobIds, jobIds.length === 1 ? result : undefined, { db: handle.db })
-
-      await handle.commit()
-      settled = true
-
-      completedResult = result
-      completedAffected = completion.affected
-    } catch (err: any) {
-      if (!settled) {
-        await handle.rollback()
-        settled = true
-      }
-
-      await this.#markJobsAttempted(name, jobIds)
-      await this.fail(name, jobIds, err)
-      failedError = err
-      didFail = true
-    } finally {
-      // Belt and braces. rollback() never rejects and commit() failing routes through the catch,
-      // so this only fires if a future edit adds a path out of the try that settles neither.
-      if (!settled) await handle.rollback()
-      if (worker) {
-        // Clear between jobs
-        worker.abortController = null
-      }
-    }
-
-    // Runs after the transaction is settled, so a spy lookup reads committed state and can never
-    // be mistaken for a handler failure. Mirrors #processJobs.
-    if (this.config.__test__enableSpies && this.#spies.has(name)) {
-      if (didFail) {
-        await this.#trackJobsFailed(name, jobs, failedError)
-      } else {
-        await this.#trackJobsCompleted(name, jobs, completedResult, completedAffected)
-      }
-    }
-  }
-
-  // The rollback that precedes a transactional failure also un-fetched the jobs, so the row no
-  // longer records the attempt that just failed. Reapply the fetch's own bookkeeping before
-  // fail() reads it, otherwise every attempt looks like the first one and a job with retries
-  // left never exhausts them.
-  async #markJobsAttempted (name: string, jobIds: string[]) {
-    const { table } = await this.getQueueCache(name)
-    const sql = plans.markJobsAttempted(this.config.schema, table)
-    await this.db.executeSql(sql, [name, jobIds])
+    this.emit(events.warning, {
+      message: `transactional workers can hold ${pinned} of this pool's ${max} connections while their handlers run, leaving nothing for fetches, failures, or maintenance. Raise max above ${pinned}, or lower localConcurrency.`,
+      data: { type: WARNING_TYPES.TRANSACTIONAL_POOL_HEADROOM, max, transactionalWorkers: pinned }
+    })
   }
 
   private addWorker (worker: Worker<any>) {
