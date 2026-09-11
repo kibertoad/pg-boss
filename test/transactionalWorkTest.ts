@@ -393,6 +393,73 @@ describeTransactional('transactional work', function () {
     expect(rows.length).toBe(1)
   })
 
+  it('should roll back when the handler settles a claim it no longer holds', async function () {
+    ctx.boss = await helper.start(ctx.bossConfig)
+
+    const ledger = `${ctx.schema}.ledger`
+    const db = ctx.boss.getDb()
+
+    await db.executeSql(`CREATE TABLE ${ledger} (id serial primary key)`)
+
+    const jobId = await ctx.boss.send(ctx.schema, { work: true }, { retryLimit: 5, retryDelay: 0 })
+    helper.assertTruthy(jobId)
+
+    let attempts = 0
+    let stolen = false
+    const selfSettled: number[] = []
+
+    await ctx.boss.work(ctx.schema, { transactional: true, pollingIntervalSeconds: 0.5 }, async (jobs, tx) => {
+      attempts++
+      await tx.executeSql(`INSERT INTO ${ledger} DEFAULT VALUES`)
+
+      if (!stolen) {
+        stolen = true
+        await ctx.boss!.fail(ctx.schema, jobs[0].id, new Error('stolen'))
+      }
+
+      // The documented pattern, run on an attempt whose claim is already gone. It asks to settle
+      // and updates nothing, which is indistinguishable from a lost claim until the count is read:
+      // counting the ask rather than the row would account for a job nobody settled and commit the
+      // ledger row under a job about to run again.
+      const response = await ctx.boss!.complete(ctx.schema, jobs[0].id, undefined, { db: tx })
+      selfSettled.push(response.affected)
+    })
+
+    await until(async () => {
+      const job = await ctx.boss!.getJobById(ctx.schema, jobId)
+      return job?.state === 'completed'
+    })
+
+    const { rows } = await db.executeSql(`SELECT id FROM ${ledger}`)
+
+    expect(attempts).toBe(2)
+    expect(selfSettled).toEqual([0, 1])
+    expect(rows.length).toBe(1)
+  })
+
+  it('should name the handler in the rollback when it settled the job with its own sql', async function () {
+    ctx.boss = await helper.start(ctx.bossConfig)
+
+    const jobId = await ctx.boss.send(ctx.schema, { work: true }, { retryLimit: 0 })
+    helper.assertTruthy(jobId)
+
+    await ctx.boss.work(ctx.schema, { transactional: true }, async (jobs, tx) => {
+      // Settling by hand was never supported, and nothing about a raw UPDATE is recognisable as a
+      // settle, so this rolls back. The message has to offer that reading too, since no claim was
+      // actually lost here.
+      await tx.executeSql(`UPDATE ${ctx.schema}.job SET state = 'completed', completed_on = now() WHERE id = $1`, [jobs[0].id])
+    })
+
+    await until(async () => {
+      const job = await ctx.boss!.getJobById(ctx.schema, jobId)
+      return job?.state === 'failed'
+    })
+
+    const job = await ctx.boss.getJobById(ctx.schema, jobId)
+    helper.assertTruthy(job)
+    expect(JSON.stringify(job.output)).toContain('settled the job with SQL of its own')
+  })
+
   it('should say so when the handler swallows a SQL error and leaves the transaction aborted', async function () {
     ctx.boss = await helper.start(ctx.bossConfig)
 
@@ -431,21 +498,143 @@ describeTransactional('transactional work', function () {
     expect(warnings.some(w => w.data?.type === 'transactional_pool_headroom')).toBe(true)
   })
 
-  it('should persist the pool headroom warning under persistWarnings', async function () {
+  it('should keep the pool headroom warning out of the warning table', async function () {
     ctx.boss = await helper.start({ ...ctx.bossConfig, max: 2, persistWarnings: true })
+
+    const warnings: any[] = []
+    ctx.boss.on('warning', warning => warnings.push(warning))
 
     const workerId = await ctx.boss.work(ctx.schema, { transactional: true, localConcurrency: 2 }, async () => {})
 
     await ctx.boss.offWork(ctx.schema, { id: workerId })
 
+    expect(warnings.some(w => w.data?.type === 'transactional_pool_headroom')).toBe(true)
+
     const db = await helper.getDb()
 
     try {
       const { rows } = await db.executeSql(plans.getWarnings(ctx.schema), [null, 10, 0])
-      expect(rows.some(row => row.type === 'transactional_pool_headroom')).toBe(true)
+      expect(rows.some(row => row.type === 'transactional_pool_headroom')).toBe(false)
     } finally {
       await db.close()
     }
+  })
+
+  it('should bound the handler transaction from the database side', async function () {
+    ctx.boss = await helper.start(ctx.bossConfig)
+
+    const jobId = await ctx.boss.send(ctx.schema, { work: true }, { expireInSeconds: 30 })
+    helper.assertTruthy(jobId)
+
+    let applied: Record<string, string | null> | undefined
+
+    await ctx.boss.work(ctx.schema, { transactional: true }, async (jobs, tx) => {
+      const { rows } = await tx.executeSql(
+        `SELECT current_setting('transaction_timeout', true) AS transaction_timeout,
+                current_setting('idle_in_transaction_session_timeout', true) AS idle_timeout`)
+      applied = rows[0]
+    })
+
+    await until(async () => {
+      const job = await ctx.boss!.getJobById(ctx.schema, jobId)
+      return job?.state === 'completed'
+    })
+
+    helper.assertTruthy(applied)
+
+    // expireInSeconds plus the 5s pg-boss allows its own rollback, on whichever GUC this server
+    // recognises. transaction_timeout arrived in PostgreSQL 17, so older servers get the idle one.
+    const bound = applied.transaction_timeout !== null ? applied.transaction_timeout : applied.idle_timeout
+    expect(bound).toBe('35s')
+  })
+
+  it('should honour an explicit transactionTimeoutSeconds', async function () {
+    ctx.boss = await helper.start(ctx.bossConfig)
+
+    const jobId = await ctx.boss.send(ctx.schema, { work: true }, { expireInSeconds: 30 })
+    helper.assertTruthy(jobId)
+
+    let applied: Record<string, string | null> | undefined
+
+    await ctx.boss.work(ctx.schema, { transactional: true, transactionTimeoutSeconds: 90 }, async (jobs, tx) => {
+      const { rows } = await tx.executeSql(
+        `SELECT current_setting('transaction_timeout', true) AS transaction_timeout,
+                current_setting('idle_in_transaction_session_timeout', true) AS idle_timeout`)
+      applied = rows[0]
+    })
+
+    await until(async () => {
+      const job = await ctx.boss!.getJobById(ctx.schema, jobId)
+      return job?.state === 'completed'
+    })
+
+    helper.assertTruthy(applied)
+
+    const bound = applied.transaction_timeout !== null ? applied.transaction_timeout : applied.idle_timeout
+    expect(bound).toBe('90s')
+  })
+
+  it('should leave the transaction unbounded at transactionTimeoutSeconds 0', async function () {
+    ctx.boss = await helper.start(ctx.bossConfig)
+
+    const jobId = await ctx.boss.send(ctx.schema, { work: true })
+    helper.assertTruthy(jobId)
+
+    let applied: Record<string, string | null> | undefined
+
+    await ctx.boss.work(ctx.schema, { transactional: true, transactionTimeoutSeconds: 0 }, async (jobs, tx) => {
+      const { rows } = await tx.executeSql(
+        `SELECT current_setting('transaction_timeout', true) AS transaction_timeout,
+                current_setting('idle_in_transaction_session_timeout', true) AS idle_timeout`)
+      applied = rows[0]
+    })
+
+    await until(async () => {
+      const job = await ctx.boss!.getJobById(ctx.schema, jobId)
+      return job?.state === 'completed'
+    })
+
+    helper.assertTruthy(applied)
+
+    // '0' is how both GUCs spell "no bound"; a server that has neither reports null for both.
+    expect(applied.transaction_timeout === null || applied.transaction_timeout === '0').toBe(true)
+    expect(applied.idle_timeout === null || applied.idle_timeout === '0').toBe(true)
+  })
+
+  it('should roll the handler back when the database gives up on its transaction', async function () {
+    ctx.boss = await helper.start(ctx.bossConfig)
+
+    const sideEffects = `${ctx.schema}.side_effect`
+    const db = ctx.boss.getDb()
+
+    await db.executeSql(`CREATE TABLE ${sideEffects} (note text)`)
+
+    const jobId = await ctx.boss.send(ctx.schema, { work: true }, { retryLimit: 0, expireInSeconds: 60 })
+    helper.assertTruthy(jobId)
+
+    // Below every in-process timer, so the server is what ends this batch. The handler keeps
+    // issuing statements, which idle_in_transaction_session_timeout would never catch, so this
+    // only asserts on a server that has transaction_timeout.
+    await ctx.boss.work(ctx.schema, { transactional: true, transactionTimeoutSeconds: 1 }, async (jobs, tx) => {
+      await tx.executeSql(`INSERT INTO ${sideEffects} VALUES ('first-half')`)
+
+      for (let i = 0; i < 15; i++) {
+        await delay(100)
+        await tx.executeSql('SELECT 1').catch(() => {})
+      }
+    })
+
+    const bounded = await db.executeSql("SELECT current_setting('transaction_timeout', true) AS guc")
+
+    if (bounded.rows[0].guc === null) return
+
+    await until(async () => {
+      const job = await ctx.boss!.getJobById(ctx.schema, jobId)
+      return job?.state === 'failed'
+    }, 4000)
+
+    const { rows } = await db.executeSql(`SELECT note FROM ${sideEffects}`)
+    expect(rows.length).toBe(0)
   })
 
   it('should reject a transactional worker on a db without transaction support', async function () {
@@ -517,6 +706,48 @@ helper.describeMultiConnectionOnly('transaction handle (connection loss)', funct
 
     await tx.rollback()
   })
+
+  it('should fail a transactional batch whose connection dies without a sqlstate', async function () {
+    // What a database-side bound looks like from the driver when it arrives as a bare disconnect
+    // rather than an error code: CockroachDB's idle_in_transaction_session_timeout reports no
+    // SQLSTATE at all, so the handle has nothing to read the cause by and only the drop to go on.
+    // pg_terminate_backend lands the same way.
+    ctx.boss = await helper.start(ctx.bossConfig)
+
+    const sideEffects = `${ctx.schema}.side_effect`
+    const db = ctx.boss.getDb()
+
+    await db.executeSql(`CREATE TABLE ${sideEffects} (note text)`)
+
+    const jobId = await ctx.boss.send(ctx.schema, { work: true }, { retryLimit: 0 })
+    helper.assertTruthy(jobId)
+
+    await ctx.boss.work(ctx.schema, { transactional: true }, async (jobs, tx) => {
+      await tx.executeSql(`INSERT INTO ${sideEffects} VALUES ('first-half')`)
+
+      const { rows } = await tx.executeSql('SELECT pg_backend_pid() AS pid')
+      const other = await helper.getDb()
+
+      try {
+        await other.executeSql('SELECT pg_terminate_backend($1)', [rows[0].pid])
+      } finally {
+        await other.close()
+      }
+    })
+
+    await until(async () => {
+      const job = await ctx.boss!.getJobById(ctx.schema, jobId)
+      return job?.state === 'failed'
+    })
+
+    const { rows } = await db.executeSql(`SELECT note FROM ${sideEffects}`)
+    expect(rows.length).toBe(0)
+
+    // The shutdown has to finish too: a raw connection error escaping the settle path would take
+    // the process with it rather than the batch.
+    await ctx.boss.stop({ graceful: false })
+    ctx.boss = undefined
+  })
 })
 
 // Option validation needs no database transaction support, so it runs on every backend.
@@ -528,6 +759,22 @@ describe('transactional work options', function () {
       // @ts-expect-error deliberately passing the wrong type
       await ctx.boss.work(ctx.schema, { transactional: 'yes' }, async () => {})
     }).rejects.toThrow(/transactional must be a boolean/)
+  })
+
+  it('should reject a non-integer transactionTimeoutSeconds', async function () {
+    ctx.boss = await helper.start(ctx.bossConfig)
+
+    await expect(async () => {
+      await ctx.boss!.work(ctx.schema, { transactional: true, transactionTimeoutSeconds: 1.5 } as any, async () => {})
+    }).rejects.toThrow(/transactionTimeoutSeconds must be an integer >= 0/)
+  })
+
+  it('should reject transactionTimeoutSeconds without transactional', async function () {
+    ctx.boss = await helper.start(ctx.bossConfig)
+
+    await expect(async () => {
+      await ctx.boss!.work(ctx.schema, { transactionTimeoutSeconds: 10 } as any, async () => {})
+    }).rejects.toThrow(/transactionTimeoutSeconds requires transactional/)
   })
 
   it('should reject transactional combined with perJobResults', async function () {

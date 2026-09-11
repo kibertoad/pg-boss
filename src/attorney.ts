@@ -461,7 +461,14 @@ function checkWorkArgs (name: string, args: any[]): {
 // limits, heartbeats) is untouched by the option, because the transaction covers only the handler
 // and the completion.
 function validateTransactionalConfig (options: any) {
-  if (!options.transactional) return
+  assert(!('transactionTimeoutSeconds' in options) || (Number.isInteger(options.transactionTimeoutSeconds) && options.transactionTimeoutSeconds >= 0),
+    'transactionTimeoutSeconds must be an integer >= 0')
+
+  if (!options.transactional) {
+    // Rejected rather than ignored: the bound only exists for a transaction pg-boss opened.
+    assert(!('transactionTimeoutSeconds' in options), 'transactionTimeoutSeconds requires transactional')
+    return
+  }
 
   // Per-job settlement partitions a batch into separate outcomes; one transaction can only commit
   // or roll back as a whole, so the two contradict each other.

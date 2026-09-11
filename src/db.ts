@@ -14,7 +14,7 @@ const DEFAULT_LISTEN_KEEP_ALIVE_INITIAL_DELAY_MS = 10000
 // How long rollback() waits for its ROLLBACK before giving up on the connection instead. A ROLLBACK
 // on a responsive connection returns in well under a millisecond, so this bounds the case where it
 // cannot get through at all, not the case where it is slow.
-const TRANSACTION_ROLLBACK_TIMEOUT_MS = 5000
+export const TRANSACTION_ROLLBACK_TIMEOUT_MS = 5000
 
 class Db extends EventEmitter implements types.IDatabase, types.EventsMixin {
   private pool!: pg.Pool

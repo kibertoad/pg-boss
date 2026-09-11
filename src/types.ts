@@ -986,6 +986,22 @@ export type WorkOptions = JobFetchOptions & JobPollingOptions & WorkConcurrencyO
    * @default false
    */
   transactional?: boolean;
+  /**
+   * How long the database gives the handler's transaction before it kills the connection under it,
+   * in seconds. Only valid with `transactional`. `0` removes the bound.
+   *
+   * Backstop for the case the in-process timers cannot cover: not a handler that hangs, which
+   * `expireInSeconds` already ends, but the process failing under it, where an open transaction
+   * goes on holding vacuum off the whole database. Applied as `transaction_timeout` where the
+   * server has it (PostgreSQL 17+, CockroachDB) and `idle_in_transaction_session_timeout`
+   * otherwise, which bounds the gaps between the handler's statements instead of the whole
+   * transaction.
+   *
+   * Defaults to `expireInSeconds` plus the 5 seconds pg-boss allows its own rollback, so the
+   * handler's own timeout and clean rollback always land first and this only fires when they did
+   * not run at all.
+   */
+  transactionTimeoutSeconds?: number;
 }
 export interface FetchGroupConcurrencyOptions {
   groupConcurrency?: number | GroupConcurrencyConfig;

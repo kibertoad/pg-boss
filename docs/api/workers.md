@@ -72,15 +72,29 @@ The default options for `work()` is 1 job every 2 seconds.
 
   The job is claimed before the transaction opens, so it is `active` for as long as the handler runs and behaves like any other job while it is: `expireInSeconds` bounds it, heartbeats refresh it, and a crashed process leaves it to be reclaimed by the timeout rather than lost. The option changes what the handler can commit atomically, and nothing about how jobs are fetched, batched, retried, or supervised.
 
-  A commit needs the claim the handler started with. If something takes the job away while the handler runs, whether that is `expireInSeconds`, a heartbeat the database stopped seeing, an operator's `cancel()` or `fail()`, or another instance's supervisor, the transaction rolls back instead of committing under a job that is about to run again. A shutdown that abandons a handler mid-flight is the same: whatever it had written by then is rolled back, and the job carries the shutdown failure. Settling the jobs from inside the handler through `tx` is not affected, since that settlement is part of the transaction being committed.
+  A commit needs the claim the handler started with. If something takes the job away while the handler runs, whether that is `expireInSeconds`, a heartbeat the database stopped seeing, an operator's `cancel()` or `fail()`, or another instance's supervisor, the transaction rolls back instead of committing under a job that is about to run again. A shutdown that abandons a handler mid-flight is the same: whatever it had written by then is rolled back, and the job carries the shutdown failure.
+
+  A handler settling its own jobs is not affected, since that settlement is part of the transaction being committed. What the check recognises is `complete()`, `fail()`, `cancel()` and `deleteJob()` called with `{ db: tx }`. A handler that settles a job by writing the job table directly is read as a lost claim and rolled back, because nothing about a raw `UPDATE` is distinguishable from one.
 
   **Requirements and limits**
 
   - Needs a database connection pg-boss can open a transaction on: the built-in pool, or a `db` adapter implementing `beginTransaction`. Passing `transactional: true` without one throws from `work()`.
   - Cannot be combined with `perJobResults`: one transaction has a single outcome, so per-job settlement has nothing to commit separately. Rejected rather than silently degraded.
   - **Every handler in flight holds a pool connection for its own duration.** Size `max` above `localConcurrency` (summed over your transactional queues) with room to spare for fetches, failures, and maintenance, or those queries wait out `connectionTimeoutMillis` and reject. pg-boss emits a `warning` at `work()` time when the pool has no room left.
-  - **The transaction is open for as long as the handler runs.** A long transaction holds its snapshot and blocks vacuum from reclaiming dead rows database-wide, so this suits handlers that finish in seconds. For long work, keep the default worker and use the `db` option on `complete()` instead. Setting `idle_in_transaction_session_timeout` on the role pg-boss connects with bounds a handler that hangs without a statement in flight.
+  - **The transaction is open for as long as the handler runs.** A long transaction holds its snapshot and blocks vacuum from reclaiming dead rows database-wide, so this suits handlers that finish in seconds. For long work, keep the default worker and use the `db` option on `complete()` instead. The database bounds it either way: see `transactionTimeoutSeconds` below.
   - **A SQL error the handler catches leaves the transaction aborted.** Postgres then rejects every later statement in it, including the completion pg-boss runs there, so the job fails even though the handler returned. Either let such an error propagate out of the handler, or isolate the statement behind a `SAVEPOINT` of your own.
+
+* **transactionTimeoutSeconds**, int, *(default=`expireInSeconds` + 5)*
+
+  How long the database gives the handler's transaction before it kills the connection under it. Only valid alongside `transactional`; `0` removes the bound.
+
+  This is not the timer that ends a slow handler. `expireInSeconds` is, and it fires first by design. What this covers is the case no timer inside the process can: the process itself failing under an open transaction (a starved event loop, a driver wedged below the promise). That transaction goes on advertising `backend_xmin` and holding vacuum off every table in the database until something closes it, which is the condition [`monitorVacuum`](./constructor.md#monitorvacuum) reports as an `xmin_horizon` warning.
+
+  ```js
+  await boss.work('charge-customer', { transactional: true, transactionTimeoutSeconds: 60 }, handler)
+  ```
+
+  The default leaves the handler's own timeout and its rollback the whole window they need, so the server only gives up once neither ran. Applied as `transaction_timeout` where the server has it (PostgreSQL 17+, CockroachDB) and `idle_in_transaction_session_timeout` otherwise, which bounds the gaps between the handler's statements rather than the transaction as a whole. Either way the connection is dropped, so the batch ends on the rolled-back path, and the job is retried under its own retry policy.
 
 * **priority**, bool — **deprecated, ignored since 12.30.0**
 
