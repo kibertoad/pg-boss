@@ -637,6 +637,64 @@ describeTransactional('transactional work', function () {
     expect(rows.length).toBe(0)
   })
 
+  it('should probe the transaction timeout again after a probe that failed', async function () {
+    ctx.boss = await helper.start(ctx.bossConfig)
+
+    const inner = ctx.boss.getDb()
+    let probes = 0
+
+    // Refuses the GUC probe once. The batch after it has to ask again: a remembered rejection
+    // would leave every transaction from then on unbounded for the life of the process.
+    const failFirstProbe = (db: types.IDatabase): types.IDatabase => ({
+      executeSql: (text: string, values?: unknown[]) => {
+        if (text.includes("current_setting('transaction_timeout'")) {
+          probes++
+
+          if (probes === 1) {
+            return Promise.reject(new Error('probe refused'))
+          }
+        }
+
+        return db.executeSql(text, values)
+      }
+    })
+
+    const db = {
+      executeSql: (text: string, values?: unknown[]) => inner.executeSql(text, values),
+      beginTransaction: async () => {
+        const tx = await inner.beginTransaction!()
+        return { ...tx, db: failFirstProbe(tx.db) }
+      }
+    }
+
+    const boss2 = new PgBoss({ ...ctx.bossConfig, db, createSchema: false, migrate: false })
+
+    await boss2.start()
+
+    try {
+      const first = await boss2.send(ctx.schema, { work: true }, { retryLimit: 0 })
+      const second = await boss2.send(ctx.schema, { work: true }, { retryLimit: 0 })
+      helper.assertTruthy(first)
+      helper.assertTruthy(second)
+
+      // One job per batch, so the refused probe and the successful one land in transactions of
+      // their own and the second job only runs once the first has been failed.
+      await boss2.work(ctx.schema, { transactional: true, batchSize: 1 }, async () => {})
+
+      await until(async () => {
+        const failed = await boss2.getJobById(ctx.schema, first)
+        const completed = await boss2.getJobById(ctx.schema, second)
+        return failed?.state === 'failed' && completed?.state === 'completed'
+      })
+
+      const failed = await boss2.getJobById(ctx.schema, first)
+      expect((failed!.output as any).message).toBe('probe refused')
+      expect(probes).toBe(2)
+    } finally {
+      await boss2.stop({ graceful: false })
+    }
+  })
+
   it('should reject a transactional worker on a db without transaction support', async function () {
     ctx.boss = await helper.start(ctx.bossConfig)
 
